@@ -76,6 +76,8 @@ describe('docker-manager (barrel re-exports)', () => {
   });
 
 
+
+
   describe('filterCapDrop via barrel', () => {
     it('returns empty for undefined or empty lists', () => {
       expect(dockerManager.filterCapDrop(undefined, null)).toEqual([]);
