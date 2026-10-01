@@ -1,5 +1,14 @@
 import { isIP } from 'net';
 import * as path from 'path';
+import {
+  ENCLAVE_AGENT_API_PROXY_IP,
+  ENCLAVE_AGENT_GITHUB_MCP_IP,
+  ENCLAVE_GITHUB_MCP_PORT,
+} from '../enclave/network';
+import {
+  type EnclaveAgentEngine,
+  type EnclaveAgentProfile,
+} from '../types/enclave-options';
 import type { MicrovmControlPeer } from '../microvm/network';
 import type {
   CloudHypervisorManagerGuestConfig,
@@ -30,7 +39,8 @@ export interface CloudHypervisorEnclaveAgentNetworkProfile {
   readonly mode: 'enclave-agent';
   readonly apiProxy: {
     readonly ip: string;
-    readonly port: number;
+    readonly engine: EnclaveAgentEngine;
+    readonly profile: EnclaveAgentProfile;
   };
   readonly githubDataPlane?: {
     readonly ip: string;
@@ -131,7 +141,11 @@ export function createAgentEnclaveCloudHypervisorProfile(options: {
   readonly enclaveId: string;
   readonly invocationId: string;
   readonly guest: CloudHypervisorManagerGuestConfig;
-  readonly apiProxy: CloudHypervisorEnclaveAgentNetworkProfile['apiProxy'];
+  readonly apiProxy: {
+    readonly ip: string;
+    readonly engine: EnclaveAgentEngine;
+    readonly profile: EnclaveAgentProfile;
+  };
   readonly githubDataPlane?: CloudHypervisorEnclaveAgentNetworkProfile['githubDataPlane'];
 }): CloudHypervisorAgentEnclaveProfile {
   return sealCloudHypervisorWorkloadProfile({
@@ -203,9 +217,27 @@ export function validateCloudHypervisorWorkloadProfile(
         ['mode', 'apiProxy', 'githubDataPlane'],
         'agent-enclave network profile',
       );
-      validateEndpoint(profile.network.apiProxy, 'dedicated API proxy');
+      assertClosedObject(
+        profile.network.apiProxy,
+        ['ip', 'engine', 'profile'],
+        'dedicated API proxy',
+      );
+      validateIp(profile.network.apiProxy.ip, 'dedicated API proxy');
+      if (
+        profile.network.apiProxy.ip !== ENCLAVE_AGENT_API_PROXY_IP ||
+        !['copilot', 'claude', 'codex', 'gemini'].includes(profile.network.apiProxy.engine) ||
+        !['openai', 'anthropic'].includes(profile.network.apiProxy.profile)
+      ) {
+        throw new Error('Cloud Hypervisor agent-enclave requires a supported dedicated API proxy engine profile');
+      }
       if (profile.network.githubDataPlane) {
         validateEndpoint(profile.network.githubDataPlane, 'GitHub data plane');
+        if (
+          profile.network.githubDataPlane.ip !== ENCLAVE_AGENT_GITHUB_MCP_IP ||
+          profile.network.githubDataPlane.port !== ENCLAVE_GITHUB_MCP_PORT
+        ) {
+          throw new Error('Cloud Hypervisor agent-enclave requires the compiler-owned GitHub data plane');
+        }
       }
       break;
     default:
@@ -231,7 +263,7 @@ export function snapshotCloudHypervisorWorkloadProfile(
 
 export function assertCloudHypervisorWorkloadLaunchable(
   profile: CloudHypervisorWorkloadProfile,
-): asserts profile is CloudHypervisorLaunchableWorkloadProfile {
+): void {
   validateCloudHypervisorWorkloadProfile(profile);
   if (profile.kind === 'agent-enclave') {
     throw new Error(
