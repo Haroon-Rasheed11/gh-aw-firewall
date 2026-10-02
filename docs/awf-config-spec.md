@@ -242,6 +242,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `apiProxy.fallbackModels` → *(config-only; maps to `AWF_FALLBACK_MODELS` — ordered model IDs retried on 5xx, timeout, or model-not-supported failures)*
 - `experimental.modelRouting` → *(config-only; experimental opt-in required for `apiProxy.routing`; defaults to off)*
 - `apiProxy.routing` → *(config-only; requires `experimental.modelRouting: true`; task-level routing objective and task conversation input)*
+- `apiProxy.routing.candidateModels` → *(optional glob patterns that limit router/classifier choices; intersected with the model policy; defaults to `apiProxy.allowedModels`)*
 - `apiProxy.modelRouter.providerType` → *(config-only; maps to `COPILOT_PROVIDER_TYPE`)*
 - `apiProxy.modelRouter.baseUrl` → *(config-only; maps to `COPILOT_PROVIDER_BASE_URL`)*
 - `apiProxy.allowedModels` → *(config-only; maps to `AWF_ALLOWED_MODELS` — JSON array of glob patterns; only matching models are permitted)*
@@ -2035,6 +2036,7 @@ apiProxy:
 | Field | Allowed values | Description |
 |-------|----------------|-------------|
 | `provider` | `copilot` (default), `openai`, `anthropic` | Restricts routing to one configured native API-proxy provider; AWF does not switch credentials or translate across providers. |
+| `candidateModels` | non-empty array of model glob patterns | Limits router/classifier choices without widening the request policy; defaults to `apiProxy.allowedModels`. |
 | `objective.goal` | `cost`, `cost-speed` | Optimization goal used by the router |
 | `objective.mode` | `economy`, `balanced`, `robust`, `auto` | Fixed routing profile, or `auto` classification |
 | `task.conversationFile` | non-empty string | Host path to the task conversation whose description the router classifies |
@@ -2055,12 +2057,12 @@ routing profile) selects the one model and effort the agent is seeded with for
 the whole run. The router is not invoked again per request or per sub-agent.
 
 The routing object is closed: `objective` and `task` are required, `provider`
-is optional, and unknown properties are rejected. Omitting `provider` preserves
-Copilot routing. OpenAI and Anthropic routing require the matching provider to
-be configured for the agent and currently require the native `api.openai.com`
-or `api.anthropic.com` target; AWF does not route custom gateways or translate
-or forward requests across provider boundaries. A supported routed run also
-requires a complete
+and `candidateModels` are optional, and unknown properties are rejected.
+Omitting `provider` preserves Copilot routing. OpenAI and Anthropic routing
+require the matching provider to be configured for the agent and currently
+require the native `api.openai.com` or `api.anthropic.com` target; AWF does not
+route custom gateways or translate or forward requests across provider
+boundaries. A supported routed run also requires a complete
 `container.images` manifest containing digest-pinned references for `router`
 and every other enabled image role. The legacy `latest` router default is kept
 only for resolver compatibility and is not a supported tag-only routed
@@ -2088,8 +2090,11 @@ Completions protocol; Anthropic uses Messages. Unsupported effort values are
 discarded, and a model with no remaining advertised effort is excluded rather
 than converted into an effortless choice.
 
-Request guards, alias resolution, and candidate filtering share
-provider-aware `allowedModels` / `disallowedModels` matching. Native patterns
+Request guards and alias resolution use the provider-aware
+`allowedModels` / `disallowedModels` policy. Candidate filtering additionally
+uses `apiProxy.routing.candidateModels` when supplied; those patterns only
+narrow the router/classifier pool and never widen the request policy. When
+omitted, candidates continue to be derived from `allowedModels`. Native patterns
 such as `gpt-*` match the native model name; qualified patterns such as
 `github-copilot/gpt-*` match that provider only. Copilot recognizes the existing
 `copilot`, `github-copilot`, and `github` provider aliases. Matching remains
