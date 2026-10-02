@@ -21,6 +21,8 @@ const {
   lookupModelRoutingMetadata,
 } = require('./model-api-mapping');
 const { isModelPermittedByPolicy } = require('./guards/model-policy-guard');
+const { normalizeModel } = require('./routing-catalogue');
+const { getModelRoutingChoices } = require('./routing-candidates');
 
 function filterModelCatalogue(entries, provider, modelPolicy, getModel) {
   if (!Array.isArray(entries) || !modelPolicy ||
@@ -49,23 +51,20 @@ function buildRoutingModelMetadata(provider, modelIds, runtimeRecords) {
     const runtime = runtimeById.get(id.toLowerCase());
     const maintained = lookupModelRoutingMetadata(id, provider);
     const endpointMapping = lookupModelEndpoints(id, provider);
-    const efforts = Array.isArray(runtime?.supportedReasoningEfforts)
-      ? runtime.supportedReasoningEfforts
-      : (runtime?.capabilities?.supports?.reasoningEffort === false
-        ? []
-        : (maintained?.reasoningEfforts ?? null));
+    const normalized = normalizeModel(id, runtime, provider);
+    const efforts = Array.isArray(normalized.efforts) ? normalized.efforts : null;
     const endpoints = Array.isArray(runtime?.supportedEndpoints)
       ? runtime.supportedEndpoints
       : (endpointMapping?.endpoints || []);
-    const runtimeContextWindow = runtime?.capabilities?.limits?.max_context_window_tokens;
-    const contextWindow = Number.isInteger(runtimeContextWindow) && runtimeContextWindow > 0
-      ? runtimeContextWindow
-      : (maintained?.contextWindowTokens ?? null);
     const runtimeHasMetadata = Array.isArray(runtime?.supportedReasoningEfforts) ||
+      Array.isArray(runtime?.capabilities?.supports?.reasoning_effort) ||
       runtime?.capabilities?.supports?.reasoningEffort === false ||
       Array.isArray(runtime?.supportedEndpoints) ||
-      (Number.isInteger(runtimeContextWindow) && runtimeContextWindow > 0);
+      typeof runtime?.modelPickerEnabled === 'boolean' ||
+      (Number.isInteger(runtime?.capabilities?.limits?.max_context_window_tokens) &&
+        runtime.capabilities.limits.max_context_window_tokens > 0);
     const hasMaintainedMetadata = maintained !== null;
+    const candidateMetadataComplete = getModelRoutingChoices(normalized, provider).length > 0;
     return {
       model_id: id,
       source: runtimeHasMetadata && hasMaintainedMetadata
@@ -73,8 +72,11 @@ function buildRoutingModelMetadata(provider, modelIds, runtimeRecords) {
         : (runtimeHasMetadata ? 'provider' : (hasMaintainedMetadata ? 'maintained' : 'incomplete')),
       supported_endpoints: endpoints,
       supported_reasoning_efforts: efforts,
-      context_window_tokens: contextWindow,
-      candidate_metadata_complete: Array.isArray(efforts) && endpoints.length > 0,
+      context_window_tokens: normalized.contextWindow ?? null,
+      candidate_metadata_complete: candidateMetadataComplete,
+      ...(provider === 'copilot' && runtime?.modelPickerEnabled === false
+        ? { candidate_metadata_reason: 'Model is not enabled in the Copilot model picker' }
+        : {}),
     };
   });
 }
@@ -84,6 +86,7 @@ function buildRoutingModelMetadata(provider, modelIds, runtimeRecords) {
  * @property {() => Array<object>}  getAdapters           - Returns registered adapters array
  * @property {() => Record<string, string[]|null>} getCachedModels - Returns model cache object
  * @property {() => Record<string, object[]>} getRuntimeModelMetadata - Returns sanitized runtime metadata
+ * @property {() => Record<string, object[]>} [getRoutingModelMetadata] - Returns private runtime metadata for routing normalization
  * @property {() => boolean}        isModelFetchComplete  - Whether startup model fetch has run
  * @property {() => { complete: boolean, results: Record<string, object> }} getKeyValidationState
  * @property {() => import('./rate-limiter').RateLimiter} getLimiter
@@ -111,6 +114,7 @@ function createManagementHandlers(deps) {
     getAdapters,
     getCachedModels,
     getRuntimeModelMetadata = () => ({}),
+    getRoutingModelMetadata,
     isModelFetchComplete,
     getKeyValidationState,
     getLimiter,
@@ -125,6 +129,7 @@ function createManagementHandlers(deps) {
     getRoutingState = () => null,
     modelPolicy = null,
   } = deps;
+  const getPrivateRoutingModelMetadata = getRoutingModelMetadata || getRuntimeModelMetadata;
 
   /**
    * Build the health response payload.
@@ -157,6 +162,7 @@ function createManagementHandlers(deps) {
   function reflectEndpoints() {
     const cachedModels = getCachedModels();
     const runtimeModelMetadata = getRuntimeModelMetadata();
+    const routingModelMetadata = getPrivateRoutingModelMetadata();
     const modelAliases = getModelAliases();
     return {
       endpoints: getAdapters().map(adapter => {
@@ -171,6 +177,12 @@ function createManagementHandlers(deps) {
           modelPolicy,
           record => record?.id,
         );
+        const privateRoutingModelMetadata = filterModelCatalogue(
+          routingModelMetadata[adapter.name] || null,
+          adapter.name,
+          modelPolicy,
+          record => record?.id,
+        );
         return {
           provider:   info.provider,
           port:       info.port,
@@ -181,7 +193,7 @@ function createManagementHandlers(deps) {
           routing_models: buildRoutingModelMetadata(
             adapter.name,
             models,
-            modelMetadata,
+            privateRoutingModelMetadata,
           ),
           models_url: info.models_url,
           ...(info.credential_kind !== undefined && { credential_kind: info.credential_kind }),
