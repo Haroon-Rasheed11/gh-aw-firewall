@@ -24,6 +24,7 @@ type bootConfig struct {
 	WorkspaceDevice string
 	WorkspaceMount  string
 	VsockPort       uint32
+	EnclaveRole     string
 	NoNetwork       bool
 	GuestIP         net.IP
 	GuestPrefix     int
@@ -47,6 +48,15 @@ func parseBootConfig(cmdline string) (bootConfig, error) {
 	noNetwork := values["awf.network-mode"] == "none"
 	if _, present := values["awf.network-mode"]; present && !noNetwork {
 		return bootConfig{}, fmt.Errorf("invalid awf.network-mode")
+	}
+	if role, present := values["awf.enclave-role"]; present && role != "script" && role != "agent" {
+		return bootConfig{}, fmt.Errorf("invalid awf.enclave-role")
+	}
+	if values["awf.enclave-role"] == "script" && !noNetwork {
+		return bootConfig{}, fmt.Errorf("script enclave must not configure guest networking")
+	}
+	if values["awf.enclave-role"] == "agent" && noNetwork {
+		return bootConfig{}, fmt.Errorf("agent enclave requires its dedicated network")
 	}
 	required := []string{"awf.vsock-port"}
 	if !noNetwork {
@@ -101,6 +111,16 @@ func parseBootConfig(cmdline string) (bootConfig, error) {
 	if err != nil {
 		return bootConfig{}, err
 	}
+	if values["awf.enclave-role"] != "" {
+		if device != "" || workspaceMount != "" {
+			return bootConfig{}, fmt.Errorf("enclave cannot declare a primary workspace")
+		}
+		for _, fsMount := range virtiofsMounts {
+			if fsMount.Tag == "workspace" {
+				return bootConfig{}, fmt.Errorf("enclave cannot declare a primary workspace export")
+			}
+		}
+	}
 	if noNetwork {
 		for _, fsMount := range virtiofsMounts {
 			if fsMount.Tag == "workspace" {
@@ -134,7 +154,8 @@ func parseBootConfig(cmdline string) (bootConfig, error) {
 		}
 	}
 	return bootConfig{
-		WorkspaceDevice: device, WorkspaceMount: workspaceMount, VsockPort: uint32(port), NoNetwork: noNetwork,
+		WorkspaceDevice: device, WorkspaceMount: workspaceMount, VsockPort: uint32(port),
+		EnclaveRole: values["awf.enclave-role"], NoNetwork: noNetwork,
 		GuestIP: ip, GuestPrefix: prefix, Gateway: gateway, Interface: iface,
 		VirtiofsMounts: virtiofsMounts,
 	}, nil

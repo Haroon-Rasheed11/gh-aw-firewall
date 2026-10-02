@@ -206,6 +206,85 @@ export plan is not yet wired to a host executor; both script- and agent-enclave
 VM launches remain fail-closed until the host-executor and broker integration
 gates are implemented.
 
+### Enclave resource profiles (not launchable)
+
+The host creates one immutable resource profile from the workload role; the
+broker protocol, guest environment, and arbitrary launch metadata cannot set or
+raise these fields. The role budgets are:
+
+| Limit | Script | Agent |
+| --- | ---: | ---: |
+| Cloud Hypervisor guest RAM | 768 MiB | 768 MiB |
+| Guest vCPUs | 1 | 1 |
+| Host CPU quota | 500 milli-CPU | 500 milli-CPU |
+| Guest process limit (`RLIMIT_NPROC`, UID 65534) | 47 | 47 |
+| Per-file limit (`RLIMIT_FSIZE`) | 512 MiB | 256 MiB |
+| Open files (`RLIMIT_NOFILE`) | 1024 | 1024 |
+| Role work tmpfs | `/query`, 256 MiB | `/tmp`, 96 MiB |
+| Additional tmpfs | `/tmp` 16 MiB, `/run` 16 MiB, `/dev/shm` 32 MiB | `/home/awf-enclave` 32 MiB, `/run` 16 MiB, `/dev/shm` 32 MiB |
+| Writable virtio-fs source filesystem ceiling | 1 GiB | 512 MiB |
+| Guest UID/GID | 65534:65534 | 65534:65534 |
+
+The VM receives exactly the profile's vCPU count and memory. The host cgroup
+applies a matching 50000/100000-µs CPU quota to the VMM and its virtio-fs
+processes; the guest sees one logical vCPU, while its total host scheduling rate
+is capped at half a CPU. Host cgroup memory includes 256 MiB of VMM/device
+overhead above guest RAM. Primary-agent runs continue to use their existing
+Cloud Hypervisor options and cgroup headroom.
+
+Before the VSOCK listener starts, the guest supervisor mounts each required
+tmpfs with `nosuid,nodev` (and `noexec` for the role-work, temporary, and home
+filesystems), then
+verifies the mounted filesystem type and maximum capacity. It applies and reads
+back the process, file-size, and open-file rlimits. The guest root disk is opened
+read-only by Cloud Hypervisor and booted `ro`; the fixed virtio-fs export plan
+provides the only other write locations. Agent guests bind the writable
+`/runtime` export at `/agent` (`nosuid,nodev`), the invocation-private runtime
+root the agent entrypoint expects; boot fails if that export is missing or
+read-only. Enclave boot lines that declare a primary workspace device, mount,
+or `workspace` export are rejected. Script and agent requests must use the
+profile's fixed UID/GID. The supervisor clears supplementary groups and drops
+all capabilities except `CAP_SETGID` and `CAP_SETUID`, which its trusted
+launcher needs to transition the child identity. Capabilities, the bounding
+set, and `no_new_privs` are per-thread kernel state, so the cgo-free supervisor
+applies each change to every Go runtime thread and verifies every entry under
+`/proc/self/task` before serving requests. After the identity transition, the
+execution trampoline verifies UID/GID, empty groups, empty effective,
+permitted, inheritable, and ambient capability sets, the restricted
+`CAP_SETGID`/`CAP_SETUID` bounding set, rlimits, and `no_new_privs` on every
+thread before `exec` of workload code. `no_new_privs` prevents the workload from gaining
+privileges through executable metadata. Missing mounts, unsupported kernel
+controls, or verification mismatches abort startup rather than launching
+without a limit.
+
+Writable virtio-fs storage is accepted only when every writable export is on
+the same host filesystem and that filesystem's full capacity is no greater than
+the role ceiling. This deliberately strict check fails on typical larger runner
+filesystems; the future host executor must provide a genuinely size-bounded
+per-invocation backing filesystem or remain unavailable. It is not a per-folder
+quota and the guest cannot use `size=` to limit virtio-fs. Tmpfs ceilings are
+independent of this host filesystem ceiling.
+
+The rootfs build removes package-manager executables, the importable `pip` and
+`ensurepip` modules (so `python3 -m pip` cannot run or be recreated),
+setuid/setgid files, and file capabilities before creating either role image.
+The build executes each image's Python to confirm neither module resolves, and
+the verifier checks required supervisor/runtime paths and the absence of those
+modules in every Python library tree. The build also checks that no privilege
+bits or file capabilities remain.
+
+`TestEnclaveGuestLimitsLive` (run as root by the Cloud Hypervisor preview
+workflow) applies the real agent-role tmpfs, rlimit, read-only root, and
+all-thread privilege setup in a private mount namespace and launches a workload
+through the execution trampoline. The workload must observe `ENOSPC` on each
+bounded tmpfs, `EFBIG`, `EMFILE`, and `EAGAIN` at the file-size, open-file, and
+process limits, `EROFS` on read-only storage, UID/GID 65534 with no groups, and
+empty capabilities with `no_new_privs` on every thread. Booting enclave rootfs
+images under KVM remains gated on the host executor integration. No runtime-required privilege exception is
+allowlisted. These profiles and guest controls do not enable Cloud Hypervisor
+enclave execution: the host executor and broker integration remain separate
+gates, and current script/agent enclave launch attempts still fail closed.
+
 ## Security boundaries
 
 ### Host eligibility and artifact trust

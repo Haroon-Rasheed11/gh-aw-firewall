@@ -38,11 +38,11 @@ func TestParseBootConfigRejectsDuplicateArguments(t *testing.T) {
 }
 
 func TestParseBootConfigAcceptsWorkspaceLessNoNetwork(t *testing.T) {
-	config, err := parseBootConfig("awf.network-mode=none awf.vsock-port=1024 awf.virtiofs=seed:L3NlZWQ:ro")
+	config, err := parseBootConfig("awf.network-mode=none awf.enclave-role=script awf.vsock-port=1024 awf.virtiofs=seed:L3NlZWQ:ro")
 	if err != nil {
 		t.Fatalf("parse no-network config: %v", err)
 	}
-	if !config.NoNetwork || config.WorkspaceMount != "" || config.GuestIP != nil || len(config.VirtiofsMounts) != 1 {
+	if !config.NoNetwork || config.EnclaveRole != "script" || config.WorkspaceMount != "" || config.GuestIP != nil || len(config.VirtiofsMounts) != 1 {
 		t.Fatalf("unexpected no-network config: %#v", config)
 	}
 }
@@ -75,6 +75,7 @@ func TestParseBootConfigRejectsMixedNetworkAndWorkspace(t *testing.T) {
 	}
 	for _, cmdline := range []string{
 		"awf.network-mode=invalid " + validCmdline,
+		"awf.enclave-role=untrusted " + validCmdline,
 		"awf.network-mode= " + validCmdline,
 		"awf.vsock-port=1024",
 		"awf.network-mode=none awf.vsock-port=1024 awf.network-mode=none",
@@ -112,6 +113,19 @@ func TestParseBootConfigRejectsUnsafeVirtiofs(t *testing.T) {
 	for _, value := range cases {
 		if _, err := parseBootConfig(base + value); err == nil {
 			t.Errorf("unsafe virtiofs config accepted: %q", value)
+		}
+	}
+}
+
+func TestParseBootConfigRejectsEnclaveWorkspace(t *testing.T) {
+	network := " awf.vsock-port=1024 awf.guest-ip=192.0.2.2 awf.guest-prefix=24 awf.guest-gateway=192.0.2.1 awf.guest-interface=eth0"
+	for _, cmdline := range []string{
+		"awf.enclave-role=agent awf.workspace-mount=/workspace awf.virtiofs=workspace:L3dvcmtzcGFjZQ:rw" + network,
+		"awf.enclave-role=agent awf.workspace-device=/dev/vdb awf.workspace-mount=/workspace" + network,
+		"awf.enclave-role=agent awf.virtiofs=workspace:L3dvcmtzcGFjZQ:rw" + network,
+	} {
+		if _, err := parseBootConfig(cmdline); err == nil {
+			t.Errorf("enclave workspace accepted: %s", cmdline)
 		}
 	}
 }
