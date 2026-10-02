@@ -141,10 +141,10 @@ closure.
 
 `requestId` is a 128-bit random value. `invoke` idempotency is
 `(run ID, entry ID, invocation ID)` and records the accepted immutable
-request hash before VM creation. The same tuple and hash returns the same
-in-progress or settled record; a differing hash is terminal. The executor
-persists enough state to reconcile a broker restart, while never replaying a
-guest workload. A response is similarly bounded to 64 KiB and uses a canonical
+request hash before VM creation. The same tuple and hash may return the same
+in-progress record; terminal identities cannot be invoked again, and a differing
+hash is rejected. Recovery never replays a guest workload or resumes an old
+run's capability. A response is similarly bounded to 64 KiB and uses a canonical
 redacted failure for authorization, policy, and infrastructure denial.
 
 Version `2` is exact-match only. There is no downgrade or feature probing:
@@ -157,15 +157,22 @@ continues to use the independently versioned `GUEST_PROTOCOL_VERSION`.
 The protocol and concrete host executor backend are implemented, including
 release-attested role rootfs preflight, a bounded per-invocation tmpfs, fixed
 guest profiles, schema-validated result collection, deadline/cancellation
-handling, and VM/storage cleanup. The host-executor listener is not yet
-constructed by a runtime, and Cloud Hypervisor enclave configurations still
-fail closed.
+handling, and VM/storage cleanup. The internal host service composes verified
+host/artifact preflight with the authenticated listener. The broker's host
+adapter dispatches only after request validation and admission by the shared
+information ledger; both roles use the same authenticated channel. It does not
+stage local workspaces or launch containers for host-owned invocations.
+Cloud Hypervisor enclave configurations still fail closed at runtime selection
+and broker startup pending supported-host real-KVM security validation. There
+is no environment-variable opt-in or fallback to an unconfined runtime.
 
 | Piece | Owner and location |
 | --- | --- |
 | Wire codec and validation | AWF host, `src/enclave/host-executor-protocol.ts` |
 | Listener, replay/idempotency state, trusted plan derivation | AWF host, `src/enclave/host-executor-server.ts` |
 | Broker client (mirror of the codec) | `enclave-mcp-server`, `containers/enclave/mcp-server/host-executor-client.js` |
+| Broker dispatch, cancellation, and settlement | `containers/enclave/mcp-server/host-executor-runner.js` |
+| Preflight/listener composition (internal only) | `src/enclave/cloud-hypervisor-host-service.ts` |
 | Contract and rejection tests | `src/enclave/host-executor-protocol.test.ts` (drives the real client against the real server) |
 | Trusted one-shot VM executor | `src/cloud-hypervisor/host-enclave-executor.ts` |
 | Guest path compatibility | `guest/microvm-supervisor/resources_linux.go` |
@@ -213,26 +220,93 @@ profile, and limits are not expressible.
 **Responses and failures.** Success responses carry the invocation `state`
 (`running`, `cancelling`, `terminal`, `settled`), `cancelGeneration`, and, once
 terminal, `outcome`, `resultDigest`, and a result of at most 8 KiB (`success`
-only). A cancelled invocation always reports `cancelled`. An invalid or failing
-backend result reports `executor-failure` with no detail. Failure codes form a
+only). Confirmed cancellation reports `cancelled`, but cannot mask an executor
+failure. Unconfirmed cleanup remains nonterminal and closes admissions.
+A confirmed failing backend result reports `executor-failure` with no detail. Failure codes form a
 closed set: `denied`, `replayed`, `conflict`, `unknown-invocation`,
 `invalid-state`, and `closed`. Every failure before or during authentication and
 validation gets the byte-identical response `{"version":2,"ok":false,"error":"denied"}`.
 This covers framing, size, UTF-8, strict JSON, capability, run, version, type,
 unknown or prohibited fields, and value checks. Trusted-policy denials also get
-`denied`. A rejected request has no execution side effect.
+`denied`. Authorization and malformed-request rejection cause no launch side
+effects. A lifecycle journal failure also aborts existing execution safely.
 
 **Replay and idempotency.** An authenticated `requestId` is accepted at most
 once per run and replays get `replayed`. Invocation replay is keyed by
 `(run ID, entry ID, invocation ID)`. The immutable request hash includes the
-entry ID and is recorded before the backend is called. The same hash returns
-the existing record, and a different hash is a `conflict`. Settlement requires
+entry ID and is durably recorded before the backend is called. The same hash
+returns the existing in-progress record, and a different hash is a `conflict`.
+Terminal and settled invocation IDs cannot be invoked again; invocation and
+admission IDs cannot be reused under another entry. Settlement requires
 a terminal invocation and the matching digest.
 It is idempotent once settled and drops the retained result. After
-`closeAdmissions()`, `invoke` returns `closed`, while `cancel`, `status`, and
+`closeAdmissions()`, new invocations return `closed` (in-progress retries remain
+idempotent), while `cancel`, `status`, and
 `settle` keep working so the broker can drain. Request-ID and invocation tables
 are bounded. Reaching either bound closes admissions. A bounded reserve of
 request IDs keeps `cancel`, `status`, and `settle` working for draining.
+
+### Integrated invocation lifecycle
+
+The broker uses the existing shared serialization lane and per-repository
+information ledger before dispatch. Neither a host response nor switching roles
+resets those budgets. Host-owned invocations bypass broker workspace creation,
+local launch, artifact preservation, and output-file collection.
+
+The internal broker contract uses a read-only bind of only the listener's private
+runtime directory at `/run/awf-enclave-host-executor`, containing `executor.sock`
+and `capability`. The broker must run under the host-authorized identity without
+widening directory/socket/file permissions. Trusted run and role entry IDs must
+match the host catalog. Neither this bind nor the persistent journal is exposed
+to the primary agent or guest. Runtime/Compose activation remains disabled;
+removing the rollout gate must first validate this exact custody and shutdown
+ordering on a supported host.
+
+The host owns the invocation deadline. Authenticated status polling renews a
+15-second host-side liveness lease (trusted host-only range: 1–60,000 ms);
+broker disappearance expires the lease and aborts the invocation. The broker
+bounds each exchange to four seconds and polls every 25 ms by default.
+Cancellation carries an increasing generation and affects
+only the recorded invocation. Broker shutdown and interrupted MCP requests
+propagate cancellation instead of leaving the VM running.
+
+The host publishes terminal state only after backend execution and cleanup
+return and the terminal journal write succeeds. Unconfirmed cleanup remains
+nonterminal and closes admissions; it cannot be reported as a completed timeout
+or cancellation. The broker verifies the terminal
+digest (SHA-256 of JSON `[outcome, result-or-null]`) and finite result schema,
+then acknowledges the same digest with `settle`. A public success is possible
+only after a matching `settled` response. Failure, timeout, and cancellation
+carry no result. Ambiguous transport, protocol, cancellation, or settlement
+closes broker admissions, including the shared lane, rather than returning data
+or trying another runtime. Guest stdout/stderr and arbitrary backend errors are
+never forwarded.
+
+### Restart recovery
+
+The host writes an exclusive, durable run tombstone and invocation/admission
+transitions before launch under
+`/var/lib/awf-cloud-hypervisor/host-executor-journal`, outside the ephemeral
+workspace and broker-visible runtime directory. The journal contains opaque identities, request
+hashes, outcomes, and result digests, not payloads, capabilities, credentials, or
+results. Even a cleanly closed run cannot restart under the same identity; a torn
+or uncertain journal does not authorize resumption.
+
+Invocation storage has a separate write-ahead resource journal, complementing
+the existing Cloud Hypervisor VM cleanup registry. Recovery checks process boot
+ID/start time and directory/mount identities before touching recorded resources.
+VM teardown precedes removal of invocation tmpfs or artifact storage so a live
+VM cannot retain an export. Missing already-cleaned resources are handled
+idempotently; changed identities, unsafe paths, partial mount state, malformed
+records, or failed cleanup are retained for operator recovery and prevent new
+execution. Recovery is limited to validated AWF-owned records, never a broad
+directory sweep or a PID/name-only kill.
+
+After interruption, recover orphan resources with the trusted host preflight and
+cleanup path, retain the old run tombstone, and start a fresh run identity and
+broker ledger. Do not manually discard uncertain records to force admission.
+There is no automatic workload retry, capability reuse, or reconstruction of a
+repository's disclosure balance from guest output.
 
 ## Network contract
 
@@ -268,7 +342,7 @@ Host VFS policy, not a guest read/write flag, enforces exports.
 | Material | Guest visibility | Mode and lifetime |
 | --- | --- | --- |
 | Selected static seed and immutable inputs | Selected VM only | Read-only, one invocation |
-| Bounded result/output directory | Selected VM only | Writable, size-limited, removed after settlement |
+| Bounded result/output directory | Selected VM only | Writable, size-limited, removed before terminal publication |
 | Rootfs, supervisor, runtime files | VM only | Verified immutable artifacts; invocation-private mutable overlay |
 | Protected host session/audit state | None | Host executor only, mode `0600` |
 | Static GitHub data-plane identity | Agent only when configured | Read-only invocation-private file; removed on teardown |
@@ -300,12 +374,14 @@ it must not silently provide weaker isolation.
 | Guest crash or OOM | Canonical executor failure | Revoke | Same cleanup; preserve redacted cause only |
 | Broker or executor crash | Do not rerun workload automatically | Revoke during recovery | Durable record reconciles resources by boot ID, PID start time, inode/ifindex and lease |
 | mcpg/data-plane failure | Terminal failure | Revoke if minted | Same cleanup |
-| Cleanup/revocation failure | Terminal; admissions close | Retry idempotent revocation during recovery | Preserve validated recovery record; fail closed for later microVM admissions |
+| Cleanup/revocation failure | Nonterminal `cancelling`; admissions close | Retry idempotent revocation during recovery | Preserve validated recovery record; fail closed for later microVM admissions |
 
 Before allocating resources, the executor creates an invocation-labelled,
-root-owned `0600` durable recovery record under the existing Cloud Hypervisor
-recovery hierarchy. Reconciliation never trusts a name or PID alone and is
-idempotent. Settlement is written before destroying protected state.
+root-owned `0600` write-ahead resource record in the persistent host-executor
+journal, alongside the separate Cloud Hypervisor VM cleanup registry.
+Reconciliation never trusts a name or PID alone and is idempotent. Settlement
+is durably acknowledged before dropping the retained in-memory result; run and
+invocation tombstones survive.
 
 Audit records contain opaque invocation/resource identifiers, policy and
 artifact versions, timing and resource buckets, terminal state, revocation, and
@@ -327,8 +403,10 @@ Hypervisor enclave rollout is additionally gated on:
 2. pinned, manifest-attested Cloud Hypervisor, `virtiofsd`, kernel, role rootfs,
    and guest supervisor artifacts on a supported GitHub-hosted Ubuntu x86_64 KVM
    runner;
-3. exact compatible guest-supervisor and host guest-protocol versions; and
-4. for dynamic agents, the ADR 0001 compiler handoff and mcpg v0.4.18-or-newer
+3. exact compatible guest-supervisor and host guest-protocol versions;
+4. supported-host real-KVM validation of the integrated broker boundary,
+   enforcement, cancellation, settlement, and restart recovery; and
+5. for dynamic agents, the ADR 0001 compiler handoff and mcpg v0.4.18-or-newer
    delegation controller (v0.4.17 decoded wire TTL seconds as nanoseconds).
 
 Unsupported hosts, artifacts, protocol versions, executor kinds, and image
@@ -336,6 +414,38 @@ overrides fail closed. Mixed configurations fail closed unless every selected
 runtime independently passes preflight. Non-goals are arbitrary guest egress,
 custom guest images, moving mcpg or the enclave MCP backend into a VM, and
 changing Docker/gVisor/sbx semantics.
+
+### Supported-host real-KVM validation
+
+Socket tests and substituted VM managers validate orchestration, not KVM
+isolation. Before removing either runtime-selection or broker-startup gate,
+validate the integrated path on a supported GitHub-hosted Ubuntu x86_64 runner
+with actual KVM and the pinned, release-attested artifacts:
+
+- Dispatch approved script and agent calls through mcpg, the MCP broker, the
+  authenticated host listener, and the real VM. Verify rejection of malformed
+  frames, wrong capabilities/runs/entries/seeds, unknown launch fields, and
+  identity replays before any launch side effect.
+- Probe script no-NIC enforcement and the agent's exact dedicated proxy/mcpg
+  destinations, including denied DNS, metadata, host, primary-agent, Squid, and
+  unrelated-container access. Confirm host-enforced read-only exports, bounded
+  writable storage, cgroups, process/file limits, and privilege dropping.
+- Cancel during staging, boot, execution, and result collection; exercise
+  timeout and every terminal failure. Verify the VM and filesystem daemons are
+  stopped and reaped, namespaces/cgroups/mounts and invocation-private files are
+  removed, and identities/admission state settle without a second execution.
+- Kill the broker and host at each resource-allocation boundary, then restart
+  recovery. Include partial records, stale PID/inode/mount identities, malformed
+  records, cleanup failures, and unrelated live resources. Recovery must retain
+  uncertain records, refuse new execution, and never remove unrelated resources.
+- Put unique canaries in guest stdout/stderr, private repository content,
+  credentials, and backend errors. Confirm no canary reaches the primary-agent
+  response or ordinary logs; only the admitted canonical finite-schema result
+  may be disclosed after confirmed host settlement.
+
+Record artifact/protocol versions and the security matrix results. A failed or
+unperformed check keeps the path disabled; test doubles and a successful VM
+boot are not sufficient rollout evidence.
 
 ## Blocking follow-ups
 

@@ -1,6 +1,5 @@
 import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   ENCLAVE_AGENT_API_PROXY_IP,
@@ -20,6 +19,7 @@ import type {
   HostExecutorInvocationPlan,
   HostExecutorRunState,
 } from '../enclave/host-executor-server';
+import { startHostExecutorServer } from '../enclave/host-executor-server';
 import type { CloudHypervisorOptions } from '../types/runtime-options';
 import type { CloudHypervisorCleanupRegistry } from './cleanup-registry';
 import type {
@@ -39,7 +39,7 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
   let directory: string;
 
   beforeEach(async () => {
-    directory = await fs.mkdtemp(path.join(os.tmpdir(), 'awf-enclave-result-'));
+    directory = await fs.mkdtemp(path.join(process.cwd(), '.awf-enclave-result-'));
   });
 
   describe('CloudHypervisorHostEnclaveExecutorBackend', () => {
@@ -53,7 +53,7 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
       startupDelayMs,
       expectedOutcome,
     }) => {
-      const scratch = await fs.mkdtemp(path.join(os.homedir(), '.awf-host-backend-'));
+      const scratch = await fs.mkdtemp(path.join(process.cwd(), '.awf-host-backend-'));
       const root = await fs.realpath(scratch);
       const seedsDir = path.join(root, 'seeds');
       const invocationsDir = path.join(root, 'invocations');
@@ -67,6 +67,7 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
         runId: 'a'.repeat(32),
         seedsDir,
         invocationsDir,
+        journalDir: path.join(root, 'journal'),
         entries: [{
           entryId,
           executorKind: role,
@@ -188,9 +189,21 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
         ...(role === 'agent' ? { agentPolicies: { [entryId]: agentPolicy } } : {}),
       };
       const dependencies: Partial<HostEnclaveExecutorDependencies> = {
-        createArtifactSnapshot: async () => {
+        createResourceJournal: async () => ({
+          captureDirectory: async () => undefined,
+          captureMount: async () => undefined,
+          captureSnapshot: async () => undefined,
+          prepareSnapshot: async () => undefined,
+          verifyMount: async () => undefined,
+          verifyDirectory: async () => undefined,
+          verifySnapshot: async () => undefined,
+          complete: async () => undefined,
+        }),
+        createArtifactSnapshot: async (_sources, _copy, onDirectoryCreated) => {
           const directory = path.join(root, `snapshot-${++snapshotNumber}`);
           await fs.mkdir(directory, { mode: 0o700 });
+          expect(typeof onDirectoryCreated).toBe('function');
+          await onDirectoryCreated?.(directory);
           const rootfsPath = path.join(directory, 'rootfs.ext4');
           await fs.writeFile(rootfsPath, 'fixture-rootfs', { mode: 0o400 });
           return {
@@ -467,11 +480,12 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
             },
           }, defaultUnmountDependencies);
           await expect(defaultUnmountBackend.execute(plan, new AbortController().signal))
-            .resolves.toEqual({ outcome: 'executor-failure' });
+            .resolves.toEqual({ outcome: 'executor-failure', cleanupComplete: false });
           await defaultUnmountBackend.close();
           await fs.rm(invocationHostDir, { recursive: true, force: true });
 
           const cleanupRegistry: CloudHypervisorCleanupRegistry = {
+            hasPendingRecord: async () => false,
             reapPending: async () => { throw new Error('fixture startup failure'); },
             createPending: async () => { throw new Error('unexpected cleanup record creation'); },
             create: async () => { throw new Error('unexpected cleanup record creation'); },
@@ -518,6 +532,130 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
           stopped = false;
           unmounted = false;
           snapshotRemoved = false;
+          const server = await startHostExecutorServer({
+            runtimeDir: path.join(root, 'h'),
+            runState,
+            backend: new CloudHypervisorHostEnclaveExecutorBackend(backendOptions, dependencies),
+          });
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const { createHostExecutorClient } = require('../../containers/enclave/mcp-server/host-executor-client.js');
+            const broker = createHostExecutorClient({
+              socketPath: server.socketPath, capabilityPath: server.capabilityPath, runId: runState.runId,
+            });
+            const { finiteSchemaHash } = await import('../bounded-execution/schema-hash');
+            const accepted = await broker.invoke({
+              entryId, invocationId, admissionId: plan.admissionId, executorKind: role, seedId,
+              payload: plan.payload, schema: plan.schema, schemaHash: finiteSchemaHash(plan.schema),
+            });
+            expect(accepted).toEqual(expect.objectContaining({ ok: true, state: 'running' }));
+            let status = accepted;
+            for (let attempt = 0; attempt < 100 && status.state !== 'terminal'; attempt += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              status = await broker.status({ entryId, invocationId });
+            }
+            expect(status).toEqual(expect.objectContaining({
+              ok: true, state: 'terminal', outcome: 'success', result: 'true',
+            }));
+            expect(unmounted).toBe(true);
+            expect(stopped).toBe(true);
+            expect(snapshotRemoved).toBe(true);
+            expect(await fs.lstat(invocationHostDir).catch(() => undefined)).toBeUndefined();
+            const settled = await broker.settle({ entryId, invocationId, resultDigest: status.resultDigest });
+            expect(settled).toEqual(expect.objectContaining({ ok: true, state: 'settled', outcome: 'success' }));
+            expect(settled.result).toBeUndefined();
+          } finally {
+            await server.close();
+          }
+
+          for (const [index, stage] of ['mount', 'write', 'snapshot'].entries()) {
+            let release!: () => void;
+            let entered!: () => void;
+            const blocked = new Promise<void>((resolve) => { release = resolve; });
+            const reached = new Promise<void>((resolve) => { entered = resolve; });
+            let delayedDependencies: Partial<HostEnclaveExecutorDependencies>;
+            if (stage === 'mount') {
+              delayedDependencies = {
+                ...dependencies,
+                mountTmpfs: async (...args) => {
+                  entered();
+                  await blocked;
+                  await dependencies.mountTmpfs!(...args);
+                },
+              };
+            } else if (stage === 'write') {
+              delayedDependencies = {
+                ...dependencies,
+                writeFile: async (file, contents, options) => {
+                  if (file.toString() === path.join(invocationHostDir, 'request', 'query-script.py')) {
+                    entered();
+                    await blocked;
+                  }
+                  await fs.writeFile(file, contents, options);
+                },
+              };
+            } else {
+              delayedDependencies = {
+                ...dependencies,
+                createArtifactSnapshot: async (...args) => {
+                  const created = await dependencies.createArtifactSnapshot!(...args);
+                  entered();
+                  await blocked;
+                  return created;
+                },
+              };
+            }
+            const interruptionRun = { ...runState, runId: String(index + 1).repeat(32) };
+            const interruptedServer = await startHostExecutorServer({
+              runtimeDir: path.join(root, 'h'),
+              runState: interruptionRun,
+              backend: new CloudHypervisorHostEnclaveExecutorBackend({
+                ...backendOptions, runState: interruptionRun,
+              }, delayedDependencies),
+            });
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const { createHostExecutorClient } = require('../../containers/enclave/mcp-server/host-executor-client.js');
+              const broker = createHostExecutorClient({
+                socketPath: interruptedServer.socketPath,
+                capabilityPath: interruptedServer.capabilityPath,
+                runId: interruptionRun.runId,
+              });
+              const { finiteSchemaHash } = await import('../bounded-execution/schema-hash');
+              unmounted = false;
+              snapshotRemoved = false;
+              await broker.invoke({
+                entryId, invocationId, admissionId: plan.admissionId, executorKind: role, seedId,
+                payload: plan.payload, schema: plan.schema, schemaHash: finiteSchemaHash(plan.schema),
+              });
+              await reached;
+              await broker.cancel({ entryId, invocationId, cancelGeneration: 1 });
+              expect(await broker.status({ entryId, invocationId }))
+                .toEqual(expect.objectContaining({ state: 'cancelling' }));
+              expect(await broker.settle({ entryId, invocationId, resultDigest: 'f'.repeat(64) }))
+                .toEqual(expect.objectContaining({ ok: false, error: 'invalid-state' }));
+              expect(unmounted).toBe(false);
+              release();
+              let status = await broker.status({ entryId, invocationId });
+              for (let attempt = 0; attempt < 100 && status.state !== 'terminal'; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                status = await broker.status({ entryId, invocationId });
+              }
+              expect(status).toEqual(expect.objectContaining({ state: 'terminal', outcome: 'cancelled' }));
+              expect(unmounted).toBe(true);
+              if (stage !== 'mount') expect(snapshotRemoved).toBe(true);
+              expect(await fs.lstat(invocationHostDir).catch(() => undefined)).toBeUndefined();
+              expect(await broker.settle({ entryId, invocationId, resultDigest: status.resultDigest }))
+                .toEqual(expect.objectContaining({ state: 'settled', outcome: 'cancelled' }));
+            } finally {
+              release();
+              await interruptedServer.close();
+            }
+          }
+
+          stopped = false;
+          unmounted = false;
+          snapshotRemoved = false;
           managerStartError = true;
           await expect(backend.execute(plan, new AbortController().signal))
             .resolves.toEqual({ outcome: 'executor-failure' });
@@ -537,6 +675,8 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
           stopped = false;
           unmounted = false;
           snapshotRemoved = false;
+          await expect(backend.execute(plan, new AbortController().signal))
+            .resolves.toEqual({ outcome: 'executor-failure', cleanupComplete: false });
           await expect(backend.execute(plan, new AbortController().signal))
             .resolves.toEqual({ outcome: 'executor-failure' });
           managerStopError = false;
@@ -574,7 +714,7 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
   });
 
   it('resolves the trusted CLI and removes preflight artifacts when artifact verification fails', async () => {
-    const scratch = await fs.mkdtemp(path.join(os.homedir(), '.awf-enclave-factory-'));
+    const scratch = await fs.mkdtemp(path.join(process.cwd(), '.awf-enclave-factory-'));
     const environment = {
       AWF_CLOUD_HYPERVISOR_ENCLAVE_MANIFEST: '/missing/manifest.json',
       AWF_CLOUD_HYPERVISOR_ENCLAVE_MANIFEST_BUNDLE:
@@ -632,7 +772,7 @@ describe('readBoundedCloudHypervisorEnclaveResult', () => {
   });
 
   it('verifies a release-pinned artifact set and rejects a rootfs digest mismatch', async () => {
-    const scratch = await fs.mkdtemp(path.join(os.homedir(), '.awf-enclave-preflight-'));
+    const scratch = await fs.mkdtemp(path.join(process.cwd(), '.awf-enclave-preflight-'));
     const releaseTag = `v${AWF_VERSION}`;
     const hash = (contents: string) => createHash('sha256').update(contents).digest('hex');
     const writeTrustedFile = async (name: string, contents: string): Promise<string> => {
