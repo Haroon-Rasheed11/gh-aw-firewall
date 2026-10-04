@@ -66,6 +66,19 @@ export interface HostEnclaveExecutorManager {
 }
 
 export interface HostEnclaveExecutorDependencies {
+  readonly preflight?: typeof import('./preflight').runCloudHypervisorPreflight;
+  readonly preflightEnclaveArtifacts?: typeof import('./enclave-artifact-preflight').preflightCloudHypervisorEnclaveArtifacts;
+  readonly prepareInvocationStorage?: (
+    run: HostExecutorRunState,
+    plan: HostExecutorInvocationPlan,
+    journal: HostExecutorResourceJournal,
+    tools: Pick<CloudHypervisorHostToolPaths, 'mount' | 'umount'>,
+  ) => Promise<{
+    dependencies: Partial<HostEnclaveExecutorDependencies>;
+    managerDependencies: CloudHypervisorManagerDependencies;
+    workDir: string;
+    close(): Promise<void>;
+  }>;
   readonly createArtifactSnapshot: (
     sources: CloudHypervisorArtifactSnapshotSources,
     copySparseFile: (source: string, destination: string) => Promise<void>,
@@ -93,7 +106,7 @@ export interface HostEnclaveExecutorDependencies {
     sizeBytes: number,
     uid: number,
     gid: number,
-    tools: CloudHypervisorHostToolPaths,
+    tools: Pick<CloudHypervisorHostToolPaths, 'mount' | 'umount'>,
   ) => Promise<void>;
   readonly unmount: (directory: string, tools: CloudHypervisorHostToolPaths) => Promise<void>;
   readonly verifyStorage: typeof assertBoundedEnclaveStorage;
