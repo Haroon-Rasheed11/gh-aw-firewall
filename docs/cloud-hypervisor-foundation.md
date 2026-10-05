@@ -1041,13 +1041,62 @@ The integrated privileged storage suite must pass on an eligible Linux runner.
 Until that gated job runs successfully, deterministic coverage is not a
 substitute for those probes.
 
-The remaining **unverified live assertions** include successful
-release-attested script and agent calls through the public broker; guest UID/GID,
-limits, seed read-only enforcement and capability denial inside those VMs;
-script no-NIC and agent exact-peer/port VM enforcement; guest-visible ENOSPC;
-real VM OOM, timeout/cancellation, partial-start and crash recovery; and absence
-of repository-derived stdout/stderr in real guest diagnostics. Those assertions
-remain mandatory, not waived by passing deterministic or host-only probes.
+The separately opted-in `live-kvm` job now provides a real broker-to-VM
+acceptance path. It requires the package-matched GitHub release's signed Cloud
+Hypervisor manifest/bundle and signed script/agent rootfs manifest, then uses
+the production artifact preflight and storage provider. It invokes both static
+executor tools through the public `/mcp/awf-enclave` HTTP route and requires
+canonical bounded results. The script guest reports and the harness checks
+UID/GID, seed read-only enforcement, no NIC/direct egress, privilege and
+capability drop, `no_new_privs`, and the configured process/file/open-file
+limits. Synthetic guest stdout/stderr sentinels are checked against AWF,
+gateway, broker, audit, proxy, and host-executor journal diagnostics. Diagnostic
+files are opened without following symlinks, checked and read through the same
+descriptor, and read within a hard bound even if they grow during inspection. This
+acceptance job is manually dispatched with `run_live_kvm: true`, distinct from
+the host-only probes, and is not enabled in ordinary CI or by PR labels; this
+avoids passing the Copilot credential to untrusted pull-request code.
+
+The job is not evidence of passing live acceptance until it runs successfully
+on the eligible GitHub-hosted Ubuntu x86_64 KVM/cgroup-v2 runner. In this
+checkout, package version `0.23.1` has no package-matched release containing
+the required artifact set. The gate deliberately fails after opt-in until that
+release is published; it must not use a newer release, local build artifacts,
+or an unattested-artifact switch. The supported release pipeline must publish
+the package-matched Cloud Hypervisor archive, manifest and Sigstore bundle,
+plus the enclave rootfs manifest/bundle, role rootfs images, SBOMs, and
+provenance bundles before the live test can proceed.
+
+The live harness checks the agent guest UID/GID, capability and privilege
+drop, `no_new_privs`, process/file/open-file limits, the permitted API-proxy
+peer and port, and denial of other proxy ports, peers, GitHub MCP, and public
+egress.
+Both script (1 GiB) and agent (512 MiB) guests must produce actual guest-visible
+aggregate `ENOSPC` within a write bound no larger than their configured role
+ceiling; the probe removes its files before returning a canonical result. A
+guest memory-pressure probe requires an increased guest `oom_kill` counter and
+the memory-consuming child to exit by `SIGKILL`. The harness also requires
+canonical guest-failure and timeout responses, aborts a public request only
+after its guest has reached a marker, waits for resource cleanup, and kills an
+identified VMM plus the AWF host process to verify that restart cleans the
+exact pending journal identity without replaying a successful result.
+
+One live assertion remains blocked: production has no deterministic, safe
+fault-injection control at the partial VM-startup boundary (after invocation
+resources are journaled but before VM startup completes). Exercising that case
+would require a separate production test-control/API change: the executor's
+`createManager` dependency is injectable in tests, but the live CLI exposes no
+safe fault hook around `manager.start()` or `manager.startInstance()`.
+Corrupting or replacing package-matched, release-attested artifacts is not an
+acceptable substitute. Existing deterministic and mock-manager tests cover
+partial startup, but are not live VM evidence. Neither those tests nor a
+successful host-only probe may be reported as full issue
+[#9395](https://github.com/github/gh-aw-firewall/issues/9395) acceptance.
+This conformance work is a follow-up to
+[#9395](https://github.com/github/gh-aw-firewall/issues/9395),
+[#9399](https://github.com/github/gh-aw-firewall/pull/9399), and
+[#9441](https://github.com/github/gh-aw-firewall/pull/9441); it does not claim
+that #9395 or the prior pull requests established these live assertions.
 
 ## Troubleshooting
 
