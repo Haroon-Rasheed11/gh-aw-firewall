@@ -1,8 +1,11 @@
 'use strict';
 
 const { stripRedundantProviderPrefix } = require('./model-utils');
+const { isValidRequestId } = require('./request-headers');
+const { generateRequestId } = require('./logging');
 
 const MAX_TELEMETRY_VALUE_LENGTH = 200;
+const TELEMETRY_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 /**
  * Record a per-request routing observation. Never throws: observability must
@@ -19,8 +22,9 @@ function safeRecord(observer, record) {
   }
 }
 
-function telemetryValue(value) {
-  return typeof value === 'string' && value ? value.slice(0, MAX_TELEMETRY_VALUE_LENGTH) : null;
+function telemetryModel(value) {
+  return typeof value === 'string' && value && !/[^A-Za-z0-9_.:/-]/.test(value)
+    ? value.slice(0, MAX_TELEMETRY_VALUE_LENGTH) : null;
 }
 
 /** Normalize an inference path to the endpoint name /reflect advertises. */
@@ -42,7 +46,7 @@ function requestedEffortFor(parsed, endpoint) {
   const effort = endpoint === '/v1/messages'
     ? parsed.output_config?.effort
     : (endpoint === '/responses' ? parsed.reasoning?.effort : parsed.reasoning_effort);
-  return telemetryValue(effort);
+  return typeof effort === 'string' && effort ? effort : null;
 }
 
 /**
@@ -54,18 +58,35 @@ function requestedEffortFor(parsed, endpoint) {
  * deviation telemetry (requested vs. routed model, effort, endpoint, and
  * provider), observes genuine upstream failures for requests that used the
  * selected provider and model without changing native response bytes, and
- * drains responses on the selected provider before the host reads final
+ * drains all observed responses before the host reads final
  * routing status.
  */
-function createRoutingObservation({ getSelection, recordFailure, observer }) {
+function createRoutingObservation({
+  getSelection,
+  recordFailure,
+  observer,
+  generateRequestId: makeRequestId = generateRequestId,
+}) {
   let draining = false;
   const active = new Set();
   const waiters = new Set();
 
-  function trackResponse(res, state) {
+  function trackResponse(req, res, state) {
     active.add(res);
-    function complete() {
+    function finalize() {
+      if (!active.has(res)) return;
       active.delete(res);
+      res.removeListener('finish', complete);
+      res.removeListener('close', complete);
+      const outcome = !res.writableFinished ? 'aborted'
+        : req.awfRouting.rejected ? 'rejected'
+          : res.statusCode >= 400 || state.sseFailed ? 'failed' : 'completed';
+      safeRecord(observer, {
+        ...state.telemetry,
+        request_id: req.awfRouting.requestId || res.getHeader?.('X-Request-ID') || null,
+        outcome,
+        status: res.statusCode,
+      });
       if (!res.writableFinished && state.selectedModel) {
         recordFailure('provider_unavailable');
       }
@@ -76,12 +97,25 @@ function createRoutingObservation({ getSelection, recordFailure, observer }) {
         waiters.clear();
       }
     }
-    res.once('finish', complete);
-    res.once('close', () => {
-      if (active.has(res)) {
-        complete();
+    function complete() {
+      if (!active.has(res)) return;
+      if (state.sseInspectionPending) {
+        state.responseComplete = true;
+        return;
       }
-    });
+      finalize();
+    }
+    res.once('finish', complete);
+    res.once('close', complete);
+    return {
+      sseInspectionStart() {
+        state.sseInspectionPending = true;
+      },
+      sseInspectionComplete() {
+        state.sseInspectionPending = false;
+        if (state.responseComplete) finalize();
+      },
+    };
   }
 
   function observeFailure(res, state) {
@@ -123,10 +157,11 @@ function createRoutingObservation({ getSelection, recordFailure, observer }) {
     recordFailure(typeof code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(code) ? code : 'provider_unavailable');
   }
 
-  function recordTelemetry(req, pathname, adapter, selection, body) {
+  function requestTelemetry(req, pathname, adapter, selection, body) {
+    const bodyObserved = body !== undefined;
     let parsed;
     try {
-      parsed = JSON.parse(body.toString('utf8'));
+      parsed = bodyObserved ? JSON.parse(body?.toString('utf8')) : null;
     } catch {
       parsed = null;
     }
@@ -136,17 +171,20 @@ function createRoutingObservation({ getSelection, recordFailure, observer }) {
     const selectedEndpoint = selectedEndpointFor(selection, selectedProvider, selectedEffort);
     const endpoint = endpointFor(pathname);
     const normalizedRequestedModel = stripRedundantProviderPrefix(parsed.model, adapter.name);
-    const requestedModel = telemetryValue(normalizedRequestedModel);
-    const requestedEffort = requestedEffortFor(parsed, endpoint);
+    const requestedModel = telemetryModel(normalizedRequestedModel);
+    const normalizedRequestedEffort = requestedEffortFor(parsed, endpoint);
+    const requestedEffort = TELEMETRY_EFFORTS.has(normalizedRequestedEffort) ? normalizedRequestedEffort : null;
     const deviations = [];
+    const unavailable = bodyObserved ? [] : ['model', 'effort'];
     if (adapter.name !== selectedProvider) deviations.push('provider');
-    if (normalizedRequestedModel !== selection.wire_model) deviations.push('model');
-    if (requestedEffort !== selectedEffort) deviations.push('effort');
+    if (bodyObserved && normalizedRequestedModel !== selection.wire_model) deviations.push('model');
+    if (bodyObserved && normalizedRequestedEffort !== selectedEffort) deviations.push('effort');
     if (endpoint !== selectedEndpoint) deviations.push('endpoint');
-    safeRecord(observer, {
+    return {
       stage: 'request',
-      routed: deviations.length === 0 ? 'as_selected' : 'deviated',
+      routed: deviations.length > 0 ? 'deviated' : unavailable.length > 0 ? 'unobserved' : 'as_selected',
       deviations,
+      unavailable,
       method: req.method,
       pathname,
       provider: adapter.name,
@@ -156,8 +194,7 @@ function createRoutingObservation({ getSelection, recordFailure, observer }) {
       selected_model: selection.wire_model,
       selected_effort: selectedEffort,
       selected_endpoint: selectedEndpoint,
-    });
-    return deviations;
+    };
   }
 
   return Object.freeze({
@@ -175,41 +212,54 @@ function createRoutingObservation({ getSelection, recordFailure, observer }) {
       }
       const selection = getSelection();
       if (draining || !selection || req.method !== 'POST' || !endpointFor(pathname)) return;
+      const clientRequestId = req.headers?.['x-request-id'];
+      const requestId = isValidRequestId(clientRequestId) ? clientRequestId : makeRequestId();
       // Upstream failures count as routing failures only for a request that
       // used the selected provider and model; a deviating request is the
       // agent's own choice and never ends the routed run.
-      const state = { selectedModel: false };
-      const tracked = adapter.name === (selection.provider || 'copilot');
-      let onSseData;
-      if (tracked) {
-        trackResponse(res, state);
+      const state = {
+        selectedModel: false,
+        sseFailed: false,
+        telemetry: requestTelemetry(req, pathname, adapter, selection),
+      };
+      const responseHooks = trackResponse(req, res, state);
+      if (adapter.name === (selection.provider || 'copilot')) {
         observeFailure(res, state);
-        onSseData = line => {
-          if (!state.selectedModel) return;
-          let event;
-          try {
-            event = JSON.parse(line);
-          } catch {
-            return;
-          }
-          if (event?.error || event?.type === 'response.failed' || event?.type === 'error') {
+      }
+      const onSseData = line => {
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (event?.error || event?.type === 'response.failed' || event?.type === 'error') {
+          state.sseFailed = true;
+          if (state.selectedModel) {
             const error = event.error || event.response?.error || event;
             recordNativeFailure(error.code || error.type);
           }
-        };
-      }
+        }
+      };
       // Observes the body the agent sent and never changes it: returning null
       // leaves the adapter's own transform in charge of the request.
       const bodyTransform = body => {
         try {
-          const deviations = recordTelemetry(req, pathname, adapter, selection, body);
+          state.telemetry = requestTelemetry(req, pathname, adapter, selection, body);
+          const { deviations } = state.telemetry;
           state.selectedModel = !deviations.includes('provider') && !deviations.includes('model');
         } catch {
           // Telemetry must not change the live request.
         }
         return null;
       };
-      req.awfRouting = { bodyTransform, ...(onSseData ? { onSseData } : {}) };
+      req.awfRouting = {
+        requestId,
+        bodyTransform,
+        onSseData,
+        onSseInspectionStart: responseHooks.sseInspectionStart,
+        onSseInspectionComplete: responseHooks.sseInspectionComplete,
+      };
     },
     async drain() {
       draining = true;
