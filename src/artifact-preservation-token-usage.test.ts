@@ -15,10 +15,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { mockExecaSync } from './test-helpers/mock-execa.test-utils';
-import {
-  preserveCleanupArtifacts,
-  TOKEN_USAGE_LOG_FILE,
-} from './artifact-preservation';
+import { preserveCleanupArtifacts } from './artifact-preservation';
+
+const TOKEN_USAGE_LOG_FILENAME = 'token-usage.jsonl';
 
 describe('preserveCleanupArtifacts – token usage log path', () => {
   const originalGithubEnv = process.env.GITHUB_ENV;
@@ -29,7 +28,7 @@ describe('preserveCleanupArtifacts – token usage log path', () => {
 
   function writeTokenUsage(apiProxyLogsDir: string): string {
     fs.mkdirSync(apiProxyLogsDir, { recursive: true });
-    const file = path.join(apiProxyLogsDir, TOKEN_USAGE_LOG_FILE);
+    const file = path.join(apiProxyLogsDir, TOKEN_USAGE_LOG_FILENAME);
     fs.writeFileSync(file, '{"_schema":"token-usage/v0.0.0-dev"}\n');
     return file;
   }
@@ -122,7 +121,7 @@ describe('preserveCleanupArtifacts – token usage log path', () => {
     preserveCleanupArtifacts(workDir);
 
     expect(readExports()).toBe(
-      `AWF_TOKEN_USAGE_LOG=${path.join(preserved, TOKEN_USAGE_LOG_FILE)}\n`,
+      `AWF_TOKEN_USAGE_LOG=${path.join(preserved, TOKEN_USAGE_LOG_FILENAME)}\n`,
     );
   });
 
