@@ -11,7 +11,8 @@ stdout and stderr are not result channels.
 **finite** response schema; it does not bypass guest isolation or artifact
 verification. The script enclave remains single-use, noNIC, with AWF's pinned
 role UID/GID, capabilities and resource limits. The public repository catalog
-entry and domain allowlist only enable staging this public repository.
+entry limits enclave staging to this repository; the network allowlist separately
+permits GitHub-domain egress for the run.
 The primary agent uses AWF's default Docker backend; `containerRuntime: docker`
 is not a valid explicit config enum and is intentionally omitted.
 
