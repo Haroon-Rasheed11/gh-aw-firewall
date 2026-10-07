@@ -123,12 +123,13 @@ export async function preserveVirtiofsdStartupEvidence(
   directory: string,
 ): Promise<void> {
   if (devices.length === 0) return;
-  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+  const identity = await prepareAuditDirectory(directory, dependencies);
   for (const device of devices) {
     try {
       const destination = path.join(directory, path.basename(device.evidencePath));
       await dependencies.copyFile(device.evidencePath, destination, constants.COPYFILE_EXCL);
       await dependencies.chmod(destination, 0o600);
+      await dependencies.chown(destination, identity.uid, identity.gid);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
@@ -139,13 +140,16 @@ async function copyBoundedDiagnostic(
   dependencies: CloudHypervisorManagerDependencies,
   source: string,
   destination: string,
+  identity: CloudHypervisorIdentity,
 ): Promise<void> {
+  let bounded: Buffer;
   try {
-    const bounded = await dependencies.readFileTail(source, CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
-    await dependencies.writeFile(destination, bounded, { mode: 0o600 });
+    bounded = await dependencies.readFileTail(source, CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return;
   }
+  await writeAuditFile(dependencies, destination, bounded, identity);
 }
 
 export async function waitForApiSocket(
@@ -198,22 +202,55 @@ export interface CloudHypervisorDiagnosticsContext {
   confinementEvidence: CloudHypervisorConfinementEvidence | undefined;
 }
 
+type AuditDependencies = Pick<
+  CloudHypervisorManagerDependencies,
+  'mkdir' | 'writeFile' | 'chmod' | 'chown' | 'resolveIdentity'
+>;
+
+async function prepareAuditDirectory(
+  directory: string,
+  dependencies: AuditDependencies,
+): Promise<CloudHypervisorIdentity> {
+  const identity = dependencies.resolveIdentity();
+  const parent = path.dirname(directory);
+  if (path.basename(parent) === 'cloud-hypervisor') {
+    await prepareAuditDirectory(parent, dependencies);
+  }
+  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+  await dependencies.chmod(directory, 0o700);
+  await dependencies.chown(directory, identity.uid, identity.gid);
+  return identity;
+}
+
+async function writeAuditFile(
+  dependencies: AuditDependencies,
+  destination: string,
+  contents: string | Buffer,
+  identity: CloudHypervisorIdentity,
+): Promise<void> {
+  await dependencies.writeFile(destination, contents, { mode: 0o600 });
+  await dependencies.chmod(destination, 0o600);
+  await dependencies.chown(destination, identity.uid, identity.gid);
+}
+
 export async function writeGuestOutputAudit(
   directory: string,
-  dependencies: Pick<CloudHypervisorManagerDependencies, 'mkdir' | 'writeFile'>,
+  dependencies: AuditDependencies,
   stdoutCapture: BoundedOutputCapture,
   stderrCapture: BoundedOutputCapture,
 ): Promise<void> {
-  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
-  await dependencies.writeFile(
+  const identity = await prepareAuditDirectory(directory, dependencies);
+  await writeAuditFile(
+    dependencies,
     path.join(directory, 'guest-stdout.raw.log'),
     stdoutCapture.contents(),
-    { mode: 0o600 },
+    identity,
   );
-  await dependencies.writeFile(
+  await writeAuditFile(
+    dependencies,
     path.join(directory, 'guest-stderr.raw.log'),
     stderrCapture.contents(),
-    { mode: 0o600 },
+    identity,
   );
 }
 
@@ -222,7 +259,7 @@ export async function collectCloudHypervisorDiagnostics(
   context: CloudHypervisorDiagnosticsContext,
 ): Promise<void> {
   const { dependencies, paths, config } = context;
-  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+  const identity = await prepareAuditDirectory(directory, dependencies);
   // Prefer the snapshot stop() takes *before* any shutdown attempt (see
   // the comment at the top of stop()): by the time collectDiagnostics()
   // runs via the beforeCleanup hook, the API socket is already
@@ -247,46 +284,45 @@ export async function collectCloudHypervisorDiagnostics(
       vmInfo = null;
     }
   }
-  const writeBounded = async (fileName: string, contents: Buffer): Promise<void> => {
+  const writeBounded = async (fileName: string, contents: string | Buffer): Promise<void> => {
     const destination = path.join(directory, fileName);
-    await dependencies.writeFile(destination, contents, { mode: 0o600 });
+    await writeAuditFile(dependencies, destination, contents, identity);
   };
   await writeBounded('launcher-stdout.log', context.stdoutCapture.contents());
   await writeBounded('launcher-stderr.log', context.stderrCapture.contents());
   if (context.captureGuestRawOutput !== false) {
-    await writeGuestOutputAudit(
-      directory,
-      dependencies,
-      context.guestStdoutCapture,
-      context.guestStderrCapture,
-    );
+    await writeBounded('guest-stdout.raw.log', context.guestStdoutCapture.contents());
+    await writeBounded('guest-stderr.raw.log', context.guestStderrCapture.contents());
   }
   await copyBoundedDiagnostic(
     dependencies,
     paths.logPath,
     path.join(directory, CLOUD_HYPERVISOR_LOG_NAME),
+    identity,
   );
   await copyBoundedDiagnostic(
     dependencies,
     paths.serialLogPath,
     path.join(directory, CLOUD_HYPERVISOR_SERIAL_LOG_NAME),
+    identity,
   );
   for (const [index, device] of context.fsDevices.entries()) {
     await copyBoundedDiagnostic(
       dependencies,
       device.logPath,
       path.join(directory, `virtiofs-${index}-${device.export.tag}.log`),
+      identity,
     );
     await copyBoundedDiagnostic(
       dependencies,
       device.evidencePath,
       path.join(directory, `virtiofs-${index}-${device.export.tag}-confinement.json`),
+      identity,
     );
   }
-  await dependencies.writeFile(
-    path.join(directory, 'network-plan.json'),
+  await writeBounded(
+    'network-plan.json',
     `${JSON.stringify(context.networkPlan ?? null, null, 2)}\n`,
-    { mode: 0o600 },
   );
   // Best-effort, read-only host-side network diagnostics (live nftables
   // ruleset + interface counters), captured only while the namespace
@@ -303,23 +339,20 @@ export async function collectCloudHypervisorDiagnostics(
       networkDiagnostics = `(capture failed: ${formatError(error)})`;
     }
   }
-  await dependencies.writeFile(
-    path.join(directory, 'network-diagnostics.txt'),
+  await writeBounded(
+    'network-diagnostics.txt',
     `${networkDiagnostics}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'counters.json'),
+  await writeBounded(
+    'counters.json',
     `${JSON.stringify(counters, null, 2)}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'vm-info.json'),
+  await writeBounded(
+    'vm-info.json',
     `${JSON.stringify(vmInfo, null, 2)}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'runtime.json'),
+  await writeBounded(
+    'runtime.json',
     `${JSON.stringify({
       runtime: 'cloud-hypervisor',
       version: CLOUD_HYPERVISOR_RELEASE_VERSION,
@@ -328,11 +361,9 @@ export async function collectCloudHypervisorDiagnostics(
       memoryMib: config.memoryMib,
       instanceStarted: context.instanceStarted,
     }, null, 2)}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'confinement.json'),
+  await writeBounded(
+    'confinement.json',
     `${JSON.stringify(context.confinementEvidence ?? null, null, 2)}\n`,
-    { mode: 0o600 },
   );
 }

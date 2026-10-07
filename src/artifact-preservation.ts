@@ -120,6 +120,39 @@ function chmodRuntimeArtifacts(targetDir: string, mode: 'recursive' | 'direct-fi
   }
 }
 
+function publicArtifactPaths(directory: string): string[] {
+  const entries = fs.readdirSync(directory, { withFileTypes: true });
+  return entries.flatMap((entry) => {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory() && entry.name === 'cloud-hypervisor') return [];
+    if (entry.isDirectory() && entry.name === 'diagnostics') {
+      return publicArtifactPaths(entryPath);
+    }
+    return [entryPath];
+  });
+}
+
+function hasPrivateDiagnostics(directory: string): boolean {
+  return fs.existsSync(path.join(directory, 'cloud-hypervisor')) ||
+    fs.existsSync(path.join(directory, 'diagnostics', 'cloud-hypervisor'));
+}
+
+function chmodPublicArtifacts(directory: string): void {
+  // Cloud Hypervisor diagnostics are private, runner-owned artifacts.
+  // Preserve their modes rather than applying the legacy public-log repair.
+  if (hasPrivateDiagnostics(directory)) {
+    execa.sync('chmod', ['a+rX', directory]);
+    const diagnosticsDirectory = path.join(directory, 'diagnostics');
+    if (fs.existsSync(path.join(diagnosticsDirectory, 'cloud-hypervisor'))) {
+      execa.sync('chmod', ['a+rX', diagnosticsDirectory]);
+    }
+    const publicPaths = publicArtifactPaths(directory);
+    if (publicPaths.length > 0) execa.sync('chmod', ['-R', 'a+rX', ...publicPaths]);
+  } else {
+    execa.sync('chmod', ['-R', 'a+rX', directory]);
+  }
+}
+
 function preserveDirectory({
   runtimeDir,
   runtimeSubdir,
@@ -348,7 +381,7 @@ export function preserveCleanupArtifacts(
   if (auditDir) {
     if (fs.existsSync(auditDir)) {
       try {
-        execa.sync('chmod', ['-R', 'a+rX', auditDir]);
+        chmodPublicArtifacts(auditDir);
         logger.info(`Audit artifacts available at: ${auditDir}`);
       } catch (error) {
         if (isBenignArtifactPermissionError(error)) {
@@ -367,7 +400,7 @@ export function preserveCleanupArtifacts(
     if (fs.existsSync(defaultAuditDir) && fs.readdirSync(defaultAuditDir).length > 0) {
       try {
         fs.renameSync(defaultAuditDir, auditDestination);
-        execa.sync('chmod', ['-R', 'a+rX', auditDestination]);
+        chmodPublicArtifacts(auditDestination);
         logger.info(`Audit artifacts preserved at: ${auditDestination}`);
       } catch (error) {
         logger.debug('Could not preserve audit artifacts:', error);
@@ -384,7 +417,7 @@ export function preserveCleanupArtifacts(
         for (const file of fs.readdirSync(diagnosticsDir)) {
           fs.renameSync(path.join(diagnosticsDir, file), path.join(auditDiagnosticsDir, file));
         }
-        execa.sync('chmod', ['-R', 'a+rX', auditDiagnosticsDir]);
+        chmodPublicArtifacts(auditDiagnosticsDir);
         logger.info(`Diagnostic logs available at: ${auditDiagnosticsDir}`);
       } catch (error) {
         logger.debug('Could not move diagnostics to audit dir:', error);
@@ -396,7 +429,7 @@ export function preserveCleanupArtifacts(
         for (const file of fs.readdirSync(diagnosticsDir)) {
           fs.renameSync(path.join(diagnosticsDir, file), path.join(diagnosticsDestination, file));
         }
-        execa.sync('chmod', ['-R', 'a+rX', diagnosticsDestination]);
+        chmodPublicArtifacts(diagnosticsDestination);
         logger.info(`Diagnostic logs preserved at: ${diagnosticsDestination}`);
       } catch (error) {
         logger.debug('Could not preserve diagnostic logs:', error);
@@ -405,7 +438,12 @@ export function preserveCleanupArtifacts(
   }
 
   fixArtifactPermissionsForRootless(
-    [auditDir, sessionStateDir],
+    [
+      ...(auditDir && fs.existsSync(auditDir) && hasPrivateDiagnostics(auditDir)
+        ? publicArtifactPaths(auditDir)
+        : [auditDir]),
+      sessionStateDir,
+    ],
     dockerHostPathPrefix,
     imageRegistry,
     imageTag,
