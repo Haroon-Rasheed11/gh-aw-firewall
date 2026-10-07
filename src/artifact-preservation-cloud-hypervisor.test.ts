@@ -19,6 +19,22 @@ import { mockExecaSync } from './test-helpers/mock-execa.test-utils';
 import { BoundedOutputCapture, writeGuestOutputAudit } from './cloud-hypervisor/diagnostics';
 import { dependencies } from './cloud-hypervisor/manager.test-utils';
 
+function createPrivateFile(filePath: string, contents: string): void {
+  const descriptor = fs.openSync(
+    filePath,
+    fs.constants.O_WRONLY |
+      fs.constants.O_CREAT |
+      fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    fs.writeFileSync(descriptor, contents);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 describe('Cloud Hypervisor diagnostic artifact handoff', () => {
   let scratch: string;
   const extraCleanup: string[] = [];
@@ -71,9 +87,9 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
       capture.append('secret');
       await writeGuestOutputAudit(source, deps, capture, capture);
       const ordinary = path.join(container, 'ordinary.log');
-      fs.writeFileSync(ordinary, 'public diagnostic', { mode: 0o600 });
+      createPrivateFile(ordinary, 'public diagnostic');
       const outsideFile = path.join(scratch, 'outside.log');
-      fs.writeFileSync(outsideFile, 'outside target', { mode: 0o600 });
+      createPrivateFile(outsideFile, 'outside target');
       const outsideLink = path.join(container, 'outside-link');
       fs.symlinkSync(outsideFile, outsideLink);
       if (auditDir) fs.mkdirSync(auditDir, { recursive: true });
@@ -108,7 +124,6 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
         } finally {
           fs.closeSync(descriptor);
         }
-        fs.unlinkSync(filePath);
       }
       expect(fs.statSync(path.join(destinationContainer, 'ordinary.log')).mode & 0o777).toBe(0o644);
       expect(fs.statSync(outsideFile).mode & 0o777).toBe(0o600);
