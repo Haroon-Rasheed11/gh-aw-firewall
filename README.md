@@ -9,6 +9,7 @@ A network firewall for agentic workflows that restricts outbound HTTP/HTTPS to a
 > This project is a part of GitHub's explorations of [Agentic Workflows](https://github.com/github/gh-aw). For more background, check out the [project page](https://github.github.io/gh-aw/)! ✨
 
 ## How it works
+ss
 
 `awf` runs your command inside a Docker sandbox with three containers:
 
