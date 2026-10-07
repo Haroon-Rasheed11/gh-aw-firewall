@@ -139,6 +139,8 @@ describe('NVX one-shot execution adapter', () => {
         request.filesystem.scratch.path,
         '--network-profile',
         'portable',
+        '--cpu-profile',
+        'host',
         '--network-egress',
         'deny',
         '--network-ingress',
@@ -155,6 +157,22 @@ describe('NVX one-shot execution adapter', () => {
         'stop',
         'deprovision',
         '--state-dir',
+      ]));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('passes an explicitly pinned CPU profile to NVX', async () => {
+    const { root, request } = await fixture();
+    try {
+      const args = buildNvxOneShotArguments(
+        { ...request, cpuProfile: 'intel.icelake-sp.v1' },
+        path.join(request.filesystem.runDirectory, 'outcome.json'),
+      );
+      expect(args).toEqual(expect.arrayContaining([
+        '--cpu-profile',
+        'intel.icelake-sp.v1',
       ]));
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -276,6 +294,23 @@ describe('NVX one-shot execution adapter', () => {
         workloadUid: 1000,
         workloadGid: 1000,
       })).rejects.toThrow(/scratch owner 65534:65534 must match workload identity 1000:1000/);
+      expect(runProcess).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed CPU profiles before launching NVX', async () => {
+    const { root, request } = await fixture();
+    const runProcess = jest.fn();
+    try {
+      await expect(new NvxOneShotAdapter({
+        pythonBinary: '/usr/bin/python3',
+        runProcess,
+      }).execute({
+        ...request,
+        cpuProfile: 'host invalid',
+      })).rejects.toThrow(/NVX CPU profile is invalid/);
       expect(runProcess).not.toHaveBeenCalled();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
