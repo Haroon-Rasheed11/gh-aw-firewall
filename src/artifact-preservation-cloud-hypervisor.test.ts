@@ -1,5 +1,9 @@
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('execa', () => require('./test-helpers/mock-execa.test-utils').execaMockFactory());
+jest.mock('os', () => ({
+  ...jest.requireActual<typeof import('os')>('os'),
+  tmpdir: jest.fn(),
+}));
 jest.mock('./artifact-permissions', () => ({
   ...jest.requireActual<typeof import('./artifact-permissions')>('./artifact-permissions'),
   fixArtifactPermissionsForRootless: jest.fn().mockReturnValue(true),
@@ -21,7 +25,11 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-private-diagnostics-'));
+    const systemTmpDir = jest.requireActual<typeof import('os')>('os').tmpdir();
+    scratch = fs.mkdtempSync(path.join(systemTmpDir, 'awf-private-diagnostics-'));
+    const temporaryRoot = path.join(scratch, 'tmp');
+    fs.mkdirSync(temporaryRoot, { mode: 0o700 });
+    jest.mocked(os.tmpdir).mockReturnValue(temporaryRoot);
     const realExeca = jest.requireActual<typeof execa>('execa');
     mockExecaSync.mockImplementation((command: string, args: string[]) => {
       if (command !== 'chmod') throw new Error(`Unexpected command: ${command}`);
@@ -84,10 +92,6 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
       expect(directoryStat.gid).toBe(identity.gid);
       for (const file of ['guest-stdout.raw.log', 'guest-stderr.raw.log']) {
         const filePath = path.join(destination, file);
-        const stat = fs.statSync(filePath);
-        expect(stat.mode & 0o777).toBe(0o600);
-        expect(stat.uid).toBe(identity.uid);
-        expect(stat.gid).toBe(identity.gid);
         const descriptor = fs.openSync(
           filePath,
           fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
@@ -96,6 +100,9 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
           const stat = fs.fstatSync(descriptor);
           expect(stat.isFile()).toBe(true);
           expect(stat.nlink).toBe(1);
+          expect(stat.mode & 0o777).toBe(0o600);
+          expect(stat.uid).toBe(identity.uid);
+          expect(stat.gid).toBe(identity.gid);
           fs.ftruncateSync(descriptor, 0);
           fs.writeFileSync(descriptor, '[REDACTED]');
         } finally {
