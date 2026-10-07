@@ -51,6 +51,9 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
       const identity = { uid: process.getuid!(), gid: process.getgid!() };
       const deps = dependencies({
         mkdir: fs.promises.mkdir,
+        lstat: fs.promises.lstat,
+        realpath: fs.promises.realpath,
+        open: fs.promises.open,
         writeFile: fs.promises.writeFile,
         chmod: fs.promises.chmod,
         chown: jest.fn(fs.promises.chown),
@@ -61,6 +64,10 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
       await writeGuestOutputAudit(source, deps, capture, capture);
       const ordinary = path.join(container, 'ordinary.log');
       fs.writeFileSync(ordinary, 'public diagnostic', { mode: 0o600 });
+      const outsideFile = path.join(scratch, 'outside.log');
+      fs.writeFileSync(outsideFile, 'outside target', { mode: 0o600 });
+      const outsideLink = path.join(container, 'outside-link');
+      fs.symlinkSync(outsideFile, outsideLink);
       if (auditDir) fs.mkdirSync(auditDir, { recursive: true });
 
       preserveCleanupArtifacts(workDir, { auditDir });
@@ -81,15 +88,28 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
         expect(stat.mode & 0o777).toBe(0o600);
         expect(stat.uid).toBe(identity.uid);
         expect(stat.gid).toBe(identity.gid);
-        expect(deps.chown).toHaveBeenCalledWith(path.join(source, file), identity.uid, identity.gid);
-        fs.writeFileSync(filePath, '[REDACTED]');
+        const descriptor = fs.openSync(
+          filePath,
+          fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+        );
+        try {
+          const stat = fs.fstatSync(descriptor);
+          expect(stat.isFile()).toBe(true);
+          expect(stat.nlink).toBe(1);
+          fs.ftruncateSync(descriptor, 0);
+          fs.writeFileSync(descriptor, '[REDACTED]');
+        } finally {
+          fs.closeSync(descriptor);
+        }
         fs.unlinkSync(filePath);
       }
       expect(fs.statSync(path.join(destinationContainer, 'ordinary.log')).mode & 0o777).toBe(0o644);
+      expect(fs.statSync(outsideFile).mode & 0o777).toBe(0o600);
       const repairDirectories = jest.mocked(fixArtifactPermissionsForRootless).mock.calls[0][0];
       if (auditDir) expect(repairDirectories).not.toContain(auditDir);
       expect(repairDirectories).not.toContain(destination);
       expect(repairDirectories).not.toContain(path.dirname(destination));
+      expect(repairDirectories).not.toContain(outsideLink);
     },
   );
 });

@@ -124,6 +124,7 @@ function publicArtifactPaths(directory: string): string[] {
   const entries = fs.readdirSync(directory, { withFileTypes: true });
   return entries.flatMap((entry) => {
     const entryPath = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) return [];
     if (entry.isDirectory() && entry.name === 'cloud-hypervisor') return [];
     if (entry.isDirectory() && entry.name === 'diagnostics') {
       return publicArtifactPaths(entryPath);
@@ -132,18 +133,32 @@ function publicArtifactPaths(directory: string): string[] {
   });
 }
 
+function isRealDirectory(directory: string): boolean {
+  try {
+    const stat = fs.lstatSync(directory);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 function hasPrivateDiagnostics(directory: string): boolean {
-  return fs.existsSync(path.join(directory, 'cloud-hypervisor')) ||
-    fs.existsSync(path.join(directory, 'diagnostics', 'cloud-hypervisor'));
+  return isRealDirectory(path.join(directory, 'cloud-hypervisor')) ||
+    (isRealDirectory(path.join(directory, 'diagnostics')) &&
+      isRealDirectory(path.join(directory, 'diagnostics', 'cloud-hypervisor')));
 }
 
 function chmodPublicArtifacts(directory: string): void {
+  if (!isRealDirectory(directory)) {
+    throw new Error(`Refusing to change permissions for non-directory path: ${directory}`);
+  }
   // Cloud Hypervisor diagnostics are private, runner-owned artifacts.
   // Preserve their modes rather than applying the legacy public-log repair.
   if (hasPrivateDiagnostics(directory)) {
     execa.sync('chmod', ['a+rX', directory]);
     const diagnosticsDirectory = path.join(directory, 'diagnostics');
-    if (fs.existsSync(path.join(diagnosticsDirectory, 'cloud-hypervisor'))) {
+    if (isRealDirectory(diagnosticsDirectory) &&
+      isRealDirectory(path.join(diagnosticsDirectory, 'cloud-hypervisor'))) {
       execa.sync('chmod', ['a+rX', diagnosticsDirectory]);
     }
     const publicPaths = publicArtifactPaths(directory);
@@ -275,12 +290,19 @@ function publishTokenUsageLogPath(apiProxyLogsDir: string, tokenLogSubdir: strin
 
 function preserveHostStartupDiagnostic(proxyLogsDir: string): void {
   const diagnosticPath = getStartupDiagnosticPath(proxyLogsDir);
+  let descriptor: number | undefined;
   try {
-    if (!fs.existsSync(diagnosticPath) || !fs.lstatSync(diagnosticPath).isFile()) return;
-    fs.chmodSync(diagnosticPath, 0o644);
+    descriptor = fs.openSync(
+      diagnosticPath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    if (!fs.fstatSync(descriptor).isFile()) return;
+    fs.fchmodSync(descriptor, 0o644);
     logger.info(`Startup diagnostic available at: ${diagnosticPath}`);
   } catch (error) {
     logger.debug('Could not fix startup diagnostic permissions:', error);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
   }
 }
 

@@ -27,12 +27,13 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
       const directory = path.join(scratch, 'cloud-hypervisor');
       await fs.mkdir(directory, { mode: 0o755 });
       await fs.writeFile(path.join(directory, 'guest-stdout.raw.log'), 'old', { mode: 0o644 });
-      const identity = { uid: 1234, gid: 2345 };
+      const identity = { uid: process.getuid!(), gid: process.getgid!() };
       const deps = dependencies({
         mkdir: fs.mkdir,
+        open: fs.open,
+        lstat: fs.lstat,
+        realpath: fs.realpath,
         writeFile: fs.writeFile,
-        chmod: jest.fn(fs.chmod),
-        chown: jest.fn().mockResolvedValue(undefined),
         resolveIdentity: jest.fn().mockReturnValue(identity),
       });
       const capture = new BoundedOutputCapture(1024);
@@ -65,8 +66,9 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
       }
 
       expect(deps.resolveIdentity).toHaveBeenCalledTimes(1);
-      expect(deps.chown).toHaveBeenCalledWith(directory, identity.uid, identity.gid);
       expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(directory)).uid).toBe(identity.uid);
+      expect((await fs.stat(directory)).gid).toBe(identity.gid);
       const files = await fs.readdir(directory);
       expect(files).toEqual(expect.arrayContaining([
         'guest-stdout.raw.log', 'guest-stderr.raw.log',
@@ -81,11 +83,10 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
       }
       for (const file of files) {
         const destination = path.join(directory, file);
-        expect(deps.chown).toHaveBeenCalledWith(destination, identity.uid, identity.gid);
-        expect(deps.chmod).toHaveBeenCalledWith(destination, 0o600);
         expect((await fs.stat(destination)).mode & 0o777).toBe(0o600);
+        expect((await fs.stat(destination)).uid).toBe(identity.uid);
+        expect((await fs.stat(destination)).gid).toBe(identity.gid);
       }
-      expect(deps.chown).toHaveBeenCalledTimes(files.length + 1);
     },
   );
 
@@ -94,25 +95,34 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
     const directory = path.join(root, 'boot-attempt-1');
     const deps = dependencies({
       mkdir: fs.mkdir,
+      open: fs.open,
+      lstat: fs.lstat,
+      realpath: fs.realpath,
       writeFile: fs.writeFile,
-      chmod: fs.chmod,
-      chown: jest.fn().mockResolvedValue(undefined),
+      resolveIdentity: jest.fn().mockReturnValue({
+        uid: process.getuid!(),
+        gid: process.getgid!(),
+      }),
     });
     const capture = new BoundedOutputCapture(1024);
     await writeGuestOutputAudit(directory, deps, capture, capture);
-    expect(deps.chown).toHaveBeenCalledWith(root, 1000, 1000);
-    expect(deps.chown).toHaveBeenCalledWith(directory, 1000, 1000);
     expect((await fs.stat(root)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(root)).uid).toBe(process.getuid!());
+    expect((await fs.stat(directory)).uid).toBe(process.getuid!());
   });
 
   it('propagates ownership repair failure instead of reporting a successful handoff', async () => {
+    const ownershipError = Object.assign(new Error('ownership denied'), { code: 'EPERM' });
     const deps = dependencies({
-      chown: jest.fn().mockRejectedValue(Object.assign(new Error('ownership denied'), { code: 'EPERM' })),
+      open: jest.fn(async (...args: Parameters<typeof fs.open>) => {
+        const handle = await fs.open(...args);
+        handle.chown = jest.fn().mockRejectedValue(ownershipError);
+        return handle;
+      }),
     });
     const capture = new BoundedOutputCapture(1024);
     await expect(writeGuestOutputAudit(scratch, deps, capture, capture))
       .rejects.toThrow('ownership denied');
-    expect(deps.writeFile).not.toHaveBeenCalled();
   });
 
   it('hands off startup evidence with private modes and a runner-owned diagnostic root', async () => {
@@ -122,9 +132,14 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
     const directory = path.join(root, 'startup-run');
     const deps = dependencies({
       mkdir: fs.mkdir,
+      open: fs.open,
+      lstat: fs.lstat,
+      realpath: fs.realpath,
       copyFile: fs.copyFile,
-      chmod: fs.chmod,
-      chown: jest.fn().mockResolvedValue(undefined),
+      resolveIdentity: jest.fn().mockReturnValue({
+        uid: process.getuid!(),
+        gid: process.getgid!(),
+      }),
     });
     await preserveVirtiofsdStartupEvidence(deps, [{
       export: { tag: 'workspace', source: '/workspace', target: '/workspace', mode: 'rw' },
@@ -132,11 +147,69 @@ describe('Cloud Hypervisor diagnostic ownership', () => {
       logPath: '/unused.log',
       evidencePath: evidence,
     }], directory);
-    expect(deps.chown).toHaveBeenCalledWith(root, 1000, 1000);
-    expect(deps.chown).toHaveBeenCalledWith(directory, 1000, 1000);
     const destination = path.join(directory, 'evidence.json');
-    expect(deps.chown).toHaveBeenCalledWith(destination, 1000, 1000);
     expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
     expect((await fs.stat(destination)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(destination)).uid).toBe(process.getuid!());
+    expect((await fs.stat(destination)).gid).toBe(process.getgid!());
+  });
+
+  it('rejects a symlinked diagnostic directory before changing its target', async () => {
+    const target = path.join(scratch, 'target');
+    await fs.mkdir(target, { mode: 0o700 });
+    await fs.symlink(target, path.join(scratch, 'cloud-hypervisor'));
+    const deps = dependencies({
+      open: fs.open,
+      lstat: fs.lstat,
+      realpath: fs.realpath,
+    });
+    const capture = new BoundedOutputCapture(1024);
+    await expect(writeGuestOutputAudit(path.join(scratch, 'cloud-hypervisor'), deps, capture, capture))
+      .rejects.toThrow('Refusing to use non-directory path');
+    expect((await fs.stat(target)).mode & 0o777).toBe(0o700);
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+
+  it('rejects a symlinked diagnostics parent before creating a child in its target', async () => {
+    const target = path.join(scratch, 'target');
+    const audit = path.join(scratch, 'audit');
+    await fs.mkdir(target, { mode: 0o700 });
+    await fs.mkdir(audit);
+    await fs.symlink(target, path.join(audit, 'diagnostics'));
+    const deps = dependencies({
+      mkdir: fs.mkdir,
+      open: fs.open,
+      lstat: fs.lstat,
+      realpath: fs.realpath,
+    });
+    const capture = new BoundedOutputCapture(1024);
+    const directory = path.join(audit, 'diagnostics', 'cloud-hypervisor', 'boot-attempt-1');
+    await expect(writeGuestOutputAudit(directory, deps, capture, capture))
+      .rejects.toThrow('Refusing to use non-directory path component');
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+
+  it('does not overwrite a symlink target when writing a diagnostic file', async () => {
+    const directory = path.join(scratch, 'cloud-hypervisor');
+    const target = path.join(scratch, 'outside.log');
+    await fs.mkdir(directory, { mode: 0o700 });
+    await fs.writeFile(target, 'preserve me', { mode: 0o600 });
+    await fs.symlink(target, path.join(directory, 'guest-stdout.raw.log'));
+    const deps = dependencies({
+      mkdir: fs.mkdir,
+      open: fs.open,
+      lstat: fs.lstat,
+      realpath: fs.realpath,
+      resolveIdentity: jest.fn().mockReturnValue({
+        uid: process.getuid!(),
+        gid: process.getgid!(),
+      }),
+    });
+    const capture = new BoundedOutputCapture(1024);
+    capture.append('replacement');
+    await expect(writeGuestOutputAudit(directory, deps, capture, capture)).rejects.toMatchObject({
+      code: 'ELOOP',
+    });
+    expect(await fs.readFile(target, 'utf8')).toBe('preserve me');
   });
 });

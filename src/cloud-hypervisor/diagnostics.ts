@@ -41,6 +41,27 @@ export async function readBoundedTail(filePath: string, maxBytes: number): Promi
   }
 }
 
+async function secureFileHandoff(
+  dependencies: AuditDependencies,
+  filePath: string,
+  identity: CloudHypervisorIdentity,
+): Promise<void> {
+  const handle = await dependencies.open(
+    filePath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to hand off non-regular or multiply-linked file: ${filePath}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Retains only the trailing `maximumBytes` of an unbounded output stream. */
 export class BoundedOutputCapture {
   private buffer = Buffer.alloc(0);
@@ -113,8 +134,21 @@ export async function stageDiagnosticFile(
   destination: string,
   identity: CloudHypervisorIdentity,
 ): Promise<void> {
-  await dependencies.writeFile(destination, '', { flag: 'wx', mode: 0o600 });
-  await dependencies.chown(destination, identity.uid, identity.gid);
+  const handle = await dependencies.open(
+    destination,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to create non-regular diagnostic file: ${destination}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function preserveVirtiofsdStartupEvidence(
@@ -123,13 +157,12 @@ export async function preserveVirtiofsdStartupEvidence(
   directory: string,
 ): Promise<void> {
   if (devices.length === 0) return;
-  const identity = await prepareAuditDirectory(directory, dependencies);
+  const { identity, directory: auditDirectory } = await prepareAuditDirectory(directory, dependencies);
   for (const device of devices) {
     try {
-      const destination = path.join(directory, path.basename(device.evidencePath));
+      const destination = path.join(auditDirectory, path.basename(device.evidencePath));
       await dependencies.copyFile(device.evidencePath, destination, constants.COPYFILE_EXCL);
-      await dependencies.chmod(destination, 0o600);
-      await dependencies.chown(destination, identity.uid, identity.gid);
+      await secureFileHandoff(dependencies, destination, identity);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
@@ -204,22 +237,111 @@ export interface CloudHypervisorDiagnosticsContext {
 
 type AuditDependencies = Pick<
   CloudHypervisorManagerDependencies,
-  'mkdir' | 'writeFile' | 'chmod' | 'chown' | 'resolveIdentity'
+  'mkdir' | 'lstat' | 'realpath' | 'open' | 'resolveIdentity'
 >;
+
+async function assertExistingDiagnosticComponents(
+  dependencies: AuditDependencies,
+  directory: string,
+): Promise<void> {
+  const absolutePath = path.resolve(directory);
+  const root = path.parse(absolutePath).root;
+  const segments = absolutePath.slice(root.length).split(path.sep).filter(Boolean);
+  const cloudHypervisorIndex = segments.lastIndexOf('cloud-hypervisor');
+  if (cloudHypervisorIndex < 0) return;
+  const diagnosticsIndex = segments.lastIndexOf('diagnostics');
+  const protectedIndex = diagnosticsIndex >= 0 && diagnosticsIndex < cloudHypervisorIndex
+    ? diagnosticsIndex
+    : cloudHypervisorIndex;
+  const anchor = path.join(root, ...segments.slice(0, protectedIndex));
+  let existingAncestor = anchor;
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      await dependencies.realpath(existingAncestor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      missingSegments.unshift(path.basename(existingAncestor));
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) throw error;
+      existingAncestor = parent;
+    }
+  }
+  let current = await dependencies.realpath(existingAncestor);
+  const descendants = [
+    ...missingSegments,
+    ...segments.slice(protectedIndex),
+  ];
+  for (const segment of descendants) {
+    current = path.join(current, segment);
+    let stat;
+    try {
+      stat = await dependencies.lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path component: ${current}`);
+    }
+    if ((await dependencies.realpath(current)) !== current) {
+      throw new Error(`Refusing to use non-canonical directory path: ${current}`);
+    }
+  }
+}
+
+async function realDirectoryPath(
+  dependencies: AuditDependencies,
+  directory: string,
+): Promise<string> {
+  const canonicalDirectory = await dependencies.realpath(directory);
+  const root = path.parse(canonicalDirectory).root;
+  let current = root;
+  for (const segment of canonicalDirectory.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = await dependencies.lstat(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path component: ${current}`);
+    }
+    if ((await dependencies.realpath(current)) !== current) {
+      throw new Error(`Refusing to use non-canonical directory path: ${current}`);
+    }
+  }
+  const requestedStat = await dependencies.lstat(directory);
+  if (requestedStat.isSymbolicLink() || !requestedStat.isDirectory()) {
+    throw new Error(`Refusing to use non-directory path: ${directory}`);
+  }
+  return canonicalDirectory;
+}
 
 async function prepareAuditDirectory(
   directory: string,
   dependencies: AuditDependencies,
-): Promise<CloudHypervisorIdentity> {
+): Promise<{ identity: CloudHypervisorIdentity; directory: string }> {
   const identity = dependencies.resolveIdentity();
   const parent = path.dirname(directory);
   if (path.basename(parent) === 'cloud-hypervisor') {
     await prepareAuditDirectory(parent, dependencies);
   }
+  await assertExistingDiagnosticComponents(dependencies, directory);
   await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
-  await dependencies.chmod(directory, 0o700);
-  await dependencies.chown(directory, identity.uid, identity.gid);
-  return identity;
+  const canonicalDirectory = await realDirectoryPath(dependencies, directory);
+  const handle = await dependencies.open(
+    canonicalDirectory,
+    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path: ${canonicalDirectory}`);
+    }
+    await handle.chmod(0o700);
+    await handle.chown(identity.uid, identity.gid);
+  } finally {
+    await handle.close();
+  }
+  return { identity, directory: canonicalDirectory };
 }
 
 async function writeAuditFile(
@@ -228,9 +350,24 @@ async function writeAuditFile(
   contents: string | Buffer,
   identity: CloudHypervisorIdentity,
 ): Promise<void> {
-  await dependencies.writeFile(destination, contents, { mode: 0o600 });
-  await dependencies.chmod(destination, 0o600);
-  await dependencies.chown(destination, identity.uid, identity.gid);
+  const handle = await dependencies.open(
+    destination,
+    constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to write non-regular or multiply-linked file: ${destination}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
+    await handle.truncate(0);
+    await handle.writeFile(contents);
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function writeGuestOutputAudit(
@@ -239,16 +376,16 @@ export async function writeGuestOutputAudit(
   stdoutCapture: BoundedOutputCapture,
   stderrCapture: BoundedOutputCapture,
 ): Promise<void> {
-  const identity = await prepareAuditDirectory(directory, dependencies);
+  const { identity, directory: auditDirectory } = await prepareAuditDirectory(directory, dependencies);
   await writeAuditFile(
     dependencies,
-    path.join(directory, 'guest-stdout.raw.log'),
+    path.join(auditDirectory, 'guest-stdout.raw.log'),
     stdoutCapture.contents(),
     identity,
   );
   await writeAuditFile(
     dependencies,
-    path.join(directory, 'guest-stderr.raw.log'),
+    path.join(auditDirectory, 'guest-stderr.raw.log'),
     stderrCapture.contents(),
     identity,
   );
@@ -259,7 +396,9 @@ export async function collectCloudHypervisorDiagnostics(
   context: CloudHypervisorDiagnosticsContext,
 ): Promise<void> {
   const { dependencies, paths, config } = context;
-  const identity = await prepareAuditDirectory(directory, dependencies);
+  const preparedAuditDirectory = await prepareAuditDirectory(directory, dependencies);
+  const identity = preparedAuditDirectory.identity;
+  directory = preparedAuditDirectory.directory;
   // Prefer the snapshot stop() takes *before* any shutdown attempt (see
   // the comment at the top of stop()): by the time collectDiagnostics()
   // runs via the beforeCleanup hook, the API socket is already
