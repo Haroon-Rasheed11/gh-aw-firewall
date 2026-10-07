@@ -7,10 +7,15 @@ const port = Number(process.env.MCP_GATEWAY_PORT || 8080);
 const apiKey = process.env.MCP_GATEWAY_API_KEY || '';
 const capability = process.env.AWF_ENCLAVE_MCP_CAPABILITY || '';
 const maxBodyBytes = 420 * 1024;
+// Tests point the fixture at a loopback stand-in; CI always uses the AWF alias.
+const upstreamUrl = process.env.AWF_ENCLAVE_GATEWAY_FIXTURE_UPSTREAM || 'http://awf-enclave-mcp:8080/mcp';
+const upstreamMatch = /^http:\/\/(awf-enclave-mcp|127\.0\.0\.1):(\d{1,5})\/mcp$/.exec(upstreamUrl);
+const upstreamPort = Number(upstreamMatch?.[2]);
 
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535
     || !/^[A-Za-z0-9_-]{32,256}$/.test(apiKey)
-    || !/^[a-f0-9]{64}$/.test(capability)) {
+    || !/^[a-f0-9]{64}$/.test(capability)
+    || !Number.isSafeInteger(upstreamPort) || upstreamPort < 1 || upstreamPort > 65535) {
   throw new Error('Live enclave gateway fixture configuration is invalid');
 }
 
@@ -67,7 +72,8 @@ const server = http.createServer((request, response) => {
   request.on('end', () => {
     if (bytes > maxBodyBytes) return;
     const payload = Buffer.concat(chunks);
-    const upstream = http.request('http://awf-enclave-mcp:8080/mcp', {
+    let upstreamResponded = false;
+    const upstream = http.request(upstreamUrl, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${capability}`,
@@ -76,21 +82,29 @@ const server = http.createServer((request, response) => {
       },
       timeout: 4860_000,
     }, (upstreamResponse) => {
+      upstreamResponded = true;
       const responseChunks = [];
       let responseBytes = 0;
+      const failResponse = () => {
+        if (!response.headersSent && !response.destroyed) {
+          sendJson(response, 502, { error: 'upstream unavailable' });
+        }
+      };
+      upstreamResponse.on('aborted', failResponse);
+      upstreamResponse.on('error', failResponse);
       upstreamResponse.on('data', (chunk) => {
         responseBytes += chunk.length;
         if (responseBytes > maxBodyBytes) {
+          if (!response.headersSent && !response.destroyed) {
+            sendJson(response, 502, { error: 'upstream response exceeded its bound' });
+          }
           upstream.destroy();
           return;
         }
         responseChunks.push(chunk);
       });
       upstreamResponse.on('end', () => {
-        if (responseBytes > maxBodyBytes) {
-          sendJson(response, 502, { error: 'upstream response exceeded its bound' });
-          return;
-        }
+        if (response.headersSent || response.destroyed) return;
         let parsed;
         let forwarded;
         try {
@@ -105,7 +119,14 @@ const server = http.createServer((request, response) => {
     });
     upstream.on('timeout', () => upstream.destroy(new Error('upstream timeout')));
     upstream.on('error', () => {
-      if (!response.headersSent) sendJson(response, 502, { error: 'upstream unavailable' });
+      if (response.headersSent || response.destroyed) return;
+      // Match mcpg's late-backend contract: a backend that has not answered yet is
+      // retryable, so AWF keeps polling within its readiness deadline.
+      if (!upstreamResponded) {
+        sendJson(response, 503, { error: 'backend_unavailable', retryable: true });
+        return;
+      }
+      sendJson(response, 502, { error: 'upstream unavailable' });
     });
     response.once('close', () => {
       if (!response.writableEnded) upstream.destroy();
