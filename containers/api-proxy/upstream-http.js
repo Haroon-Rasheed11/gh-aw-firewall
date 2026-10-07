@@ -106,6 +106,7 @@ function createSendUpstreamRequest({
     codexCompatibility = null,
     wireApiCompatibility = null,
     wireApiSourceBody = null,
+    wireApiEndpointRetryAttempted = false,
     attemptedModels = null,
     fallbackOrigin = null,
     protocolTranslation = null,
@@ -163,6 +164,7 @@ function createSendUpstreamRequest({
       codexCompatibility,
       wireApiCompatibility,
       wireApiSourceBody,
+      wireApiEndpointRetryAttempted,
       failures: [],
     };
 
@@ -289,6 +291,7 @@ function createSendUpstreamRequest({
                     ? wireFallback.wireApiCompatibility
                     : carryForwardWireApiCompatibility(wireApiCompatibility),
                   wireApiSourceBody: wireFallback?.wireApiSourceBody || wireApiSourceBody,
+                  wireApiEndpointRetryAttempted,
                   attemptedModels: nextAttempts(candidate),
                   fallbackOrigin: nextOrigin,
                   protocolTranslation,
@@ -322,6 +325,7 @@ function createSendUpstreamRequest({
                   ? wireFallback.wireApiCompatibility
                   : carryForwardWireApiCompatibility(origin.wireApiCompatibility),
                 wireApiSourceBody: wireFallback?.wireApiSourceBody || origin.wireApiSourceBody,
+                wireApiEndpointRetryAttempted: origin.wireApiEndpointRetryAttempted,
                 attemptedModels: nextAttempts(candidate),
                 fallbackOrigin: nextOrigin,
                 protocolTranslation: null,
@@ -414,6 +418,7 @@ function createSendUpstreamRequest({
                     codexCompatibility: carryForwardCodexCompatibility(origin.codexCompatibility),
                     wireApiCompatibility: built.wireApiCompatibility,
                     wireApiSourceBody: built.wireApiSourceBody,
+                    wireApiEndpointRetryAttempted,
                     attemptedModels: nextAttempts(candidate),
                     fallbackOrigin: nextOrigin,
                     protocolTranslation: built.protocolTranslation,
@@ -486,6 +491,7 @@ function createSendUpstreamRequest({
         codexCompatibility,
         wireApiCompatibility,
         wireApiSourceBody,
+        wireApiEndpointRetryAttempted,
         protocolTranslation,
         onModelFallback,
         onRetry: (retryHeaders) => sendUpstreamRequest(retryHeaders, {
@@ -496,6 +502,7 @@ function createSendUpstreamRequest({
           codexCompatibility,
           wireApiCompatibility,
           wireApiSourceBody,
+          wireApiEndpointRetryAttempted,
           attemptedModels,
           fallbackOrigin,
           protocolTranslation,
@@ -511,11 +518,55 @@ function createSendUpstreamRequest({
               codexCompatibility,
               wireApiCompatibility,
               wireApiSourceBody,
+              wireApiEndpointRetryAttempted,
               attemptedModels,
               fallbackOrigin,
               protocolTranslation,
             });
           });
+        },
+        onWireApiEndpointRetry: () => {
+          if (provider !== 'copilot' || !wireApiSourceBody || wireApiEndpointRetryAttempted) return false;
+          const requestedEndpoint = endpointForPath(req.url);
+          const rejectedEndpoint = endpointForPath(upstreamPath);
+          if (!requestedEndpoint || !rejectedEndpoint) return false;
+          const alternateEndpoint = rejectedEndpoint === '/responses' ? '/chat/completions' : '/responses';
+          let retryBody = wireApiSourceBody;
+          let retryCompatibility = {
+            requestedEndpoint,
+            upstreamEndpoint: requestedEndpoint,
+            passthrough: true,
+          };
+          if (alternateEndpoint !== requestedEndpoint) {
+            const translated = translateCopilotWireApi(wireApiSourceBody, req.url, {
+              upstreamEndpoint: alternateEndpoint,
+            });
+            if (!translated) return false;
+            retryBody = translated.body;
+            retryCompatibility = translated.compatibility;
+          }
+          req.awfRouting?.onEndpointTranslation?.(retryCompatibility);
+          logRequest?.('warn', 'wire_api_endpoint_retry', {
+            request_id: requestId,
+            provider,
+            rejected_endpoint: rejectedEndpoint,
+            upstream_endpoint: alternateEndpoint,
+            message: 'Copilot rejected the endpoint; retrying the same model on the other wire API',
+          });
+          const retryHeaders = rebuildBodyFramingHeaders(requestHeaders, retryBody.length);
+          retryHeaders['accept-encoding'] = 'identity';
+          sendUpstreamRequest(retryHeaders, {
+            body: retryBody, targetHost,
+            upstreamPath: replaceUpstreamEndpoint(upstreamPath, alternateEndpoint),
+            req, res, provider, requestId, startTime, span,
+            requestBytes: retryBody.length, requestSigner,
+            hasRetried, modelNotSupportedRetryCount, targetScheme,
+            codexCompatibility, wireApiCompatibility: retryCompatibility,
+            wireApiSourceBody, wireApiEndpointRetryAttempted: true, attemptedModels,
+            fallbackOrigin: { ...origin, wireApiEndpointRetryAttempted: true },
+            protocolTranslation,
+          });
+          return true;
         },
         onModelEndpointBlockedRetry: provider !== origin.provider ? null : () => {
           // The model resolved from the alias is not accessible via this endpoint
@@ -574,6 +625,7 @@ function createSendUpstreamRequest({
               ? wireFallback.wireApiCompatibility
               : carryForwardWireApiCompatibility(wireApiCompatibility),
             wireApiSourceBody: wireFallback?.wireApiSourceBody || wireApiSourceBody,
+            wireApiEndpointRetryAttempted,
             attemptedModels: [
               ...(Array.isArray(attemptedModels) && attemptedModels.length > 0
                 ? attemptedModels.map(a => toAttempt(a, provider))
