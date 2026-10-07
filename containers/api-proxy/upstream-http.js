@@ -168,7 +168,7 @@ function createSendUpstreamRequest({
     // Evaluate candidates only after an eligible failure so skipped-entry
     // evidence is retained even when no candidate is usable.
     let onModelFallback = null;
-    if (!isRoutingClassifier) {
+    if (!isRoutingClassifier && !req.awfScopedAuto) {
       const chain = getFallbackModelsDep();
       const current = chain.length > 0 ? getRequestModel(body, upstreamPath) : null;
       if (current) {
@@ -531,7 +531,10 @@ function createSendUpstreamRequest({
           const currentIdx = candidates.indexOf(currentModel);
           if (currentIdx < 0 || currentIdx >= candidates.length - 1) return false;
 
-          const nextModel = candidates[currentIdx + 1];
+          const nextModel = selectNextFallbackModel(
+            candidates.slice(currentIdx + 1), [currentModel], provider, isFallbackModelPermitted,
+          );
+          if (!nextModel) return false;
           let wireFallback = null;
           if (provider === 'copilot' && wireApiSourceBody) {
             try {
