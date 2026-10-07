@@ -111,6 +111,7 @@ describe('Cloud Hypervisor diagnostic artifact handoff', () => {
         const descriptor = fs.openSync(
           filePath,
           fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+          0o600,
         );
         try {
           const stat = fs.fstatSync(descriptor);
